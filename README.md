@@ -69,6 +69,8 @@ FLAGS:
         --punctuation       Randomly append punctuation to some words
         --numbers           Randomly insert standalone number tokens between words
         --race [<host:port>] Host a race on 0.0.0.0:7878 or connect to a race host
+        --feature <feature> Enable a gameplay feature by kebab-case name; repeat for multiple features
+        --all-gameplay-features Enable every gameplay feature, including power mode
     -V, --version           Prints version information
 
 OPTIONS:
@@ -90,6 +92,18 @@ ARGS:
 | `ttyper -w 100 -l english1000` | 100 of the 1000 most common English words |
 | `ttyper --language-file lang`  |      50 random words from the file `lang` |
 | `ttyper text.txt`              |  contents of `text.txt` split at newlines |
+| `ttyper --feature lives-system --feature power-mode` | 50 words with lives and combo feedback |
+| `ttyper --all-gameplay-features` | every gameplay challenge enabled at once |
+
+## gameplay features
+
+Gameplay features can be enabled from the settings screen or with repeated `--feature` flags. Feature names use kebab-case:
+
+`power-mode`, `lives-system`, `combo-multiplier`, `word-rush`, `checkpoint-mode`, `sudden-death-plus`, `practice-word-lock`, `streak-saver`, `ghost-race`, `adaptive-speed`, `shrinking-word-pool`, `boss-rush`, `penalty-words`, `bonus-words`, `double-points-word`, `no-repeat-mode`, `speed-ramp`, `slow-start-mode`, `random-word-length-burst`, `mirror-typing`, `anagram-mode`, `first-letter-hint-only`, `last-letter-hint-only`, `vowel-blackout`, `consonant-blackout`, `one-word-at-a-time`, `timed-per-word`, `disappearing-text`, `jumbled-sentence`, `reverse-sentence`, `case-sensitivity-mode`, `silent-letters-mode`, `extra-letter-trap`, `missing-letter-trap`, `word-swap-trick`, `fading-prompt`, `accelerating-cursor`, `freeze-power-up`, `double-time-power-up`, `word-shield`, `ricochet-mode`, `combo-breaker-word`, `random-restart-threat`, `endurance-mode`, `point-buy-mode`, `word-auction`, `negative-space-mode`, `relay-mode`, `precision-mode`, `crescendo-mode`, and `prestige-challenge`.
+
+Power Mode is inspired by the VS Code extension: correct keypresses build a live power combo, shown in the input title beside WPM and other active counters, and trigger short particle bursts around the typing cursor. Combo Multiplier, double-points words, boss words, point buy, and powerups contribute to the gameplay multiplier shown on the results screen.
+
+Some requested modes are adapted to a terminal typing-test flow. For example, Word Auction samples alternating easy/normal/hard pools automatically, Point Buy grants a starter shield/time/saver bundle, Relay Mode alternates normal words with code-like tokens every 10 words, and Crescendo treats each 25 correct words as the next round.
 
 ## languages
 
