@@ -63,6 +63,12 @@ FLAGS:
         --no-backtrack      Disable backtracking to completed words
         --sudden-death      Enable sudden death mode to restart on first error
         --no-backspace      Disable backspace
+        --time <seconds>    Use time-based mode with the specified countdown duration
+        --min-length <n>    Filter out words shorter than n characters
+        --max-length <n>    Filter out words longer than n characters
+        --punctuation       Randomly append punctuation to some words
+        --numbers           Randomly insert standalone number tokens between words
+        --race [<host:port>] Host a race on 0.0.0.0:7878 or connect to a race host
     -V, --version           Prints version information
 
 OPTIONS:
@@ -193,6 +199,8 @@ results_chart_y = "gray;italic"
 
 # restart/quit prompt in results ui
 results_restart_prompt = "gray;italic"
+# timer text in timed tests
+results_timer = "yellow;bold"
 ```
 
 ### style format
