@@ -64,6 +64,8 @@ pub struct Results {
     pub accuracy: AccuracyData,
     pub missed_words: Vec<String>,
     pub race_progress: Option<RaceProgress>,
+    pub gameplay_multiplier: f64,
+    pub gameplay_summary: Vec<String>,
 }
 
 impl From<&Test> for Results {
@@ -76,7 +78,20 @@ impl From<&Test> for Results {
             accuracy: calc_accuracy(&events),
             missed_words: calc_missed_words(test),
             race_progress: test.race_progress.clone(),
+            gameplay_multiplier: test.gameplay_multiplier(),
+            gameplay_summary: gameplay_summary(test),
         }
+    }
+}
+
+impl Results {
+    pub fn adjusted_wpm(&self) -> f64 {
+        const WPM_PER_CPS: f64 = 12.0;
+
+        self.timing.overall_cps
+            * WPM_PER_CPS
+            * f64::from(self.accuracy.overall)
+            * self.gameplay_multiplier
     }
 }
 
@@ -153,4 +168,29 @@ fn calc_missed_words(test: &Test) -> Vec<String> {
         .filter(|word| word.events.iter().any(is_missed_word_event))
         .map(|word| word.text.clone())
         .collect()
+}
+
+fn gameplay_summary(test: &Test) -> Vec<String> {
+    let mut summary = Vec::new();
+
+    if test.gameplay.max_combo > 0 {
+        summary.push(format!("Max combo: {}", test.gameplay.max_combo));
+    }
+    if let Some(lives) = test.gameplay.lives {
+        summary.push(format!("Lives left: {}", lives));
+    }
+    if test.gameplay.mistakes > 0 {
+        summary.push(format!("Mistakes: {}", test.gameplay.mistakes));
+    }
+    if test.gameplay.score_multiplier > 1.0 {
+        summary.push(format!(
+            "Gameplay multiplier: x{:.2}",
+            test.gameplay_multiplier()
+        ));
+    }
+    if let Some(reason) = &test.gameplay.end_reason {
+        summary.push(format!("Ended: {reason}"));
+    }
+
+    summary
 }

@@ -1,5 +1,6 @@
 use crate::{
     config::{Theme, THEME_NAMES},
+    gameplay::{normalize_features, GameplayFeature, ALL_GAMEPLAY_FEATURES},
     ui::ThemedWidget,
 };
 
@@ -51,6 +52,8 @@ pub struct Settings {
     pub chaos_haunted_mode: bool,
     pub chaos_blackout_mode: bool,
     pub chaos_neon_mode: bool,
+    pub gameplay_features: Vec<GameplayFeature>,
+    pub best_wpm: f64,
 }
 
 impl Default for Settings {
@@ -81,6 +84,8 @@ impl Default for Settings {
             chaos_haunted_mode: false,
             chaos_blackout_mode: false,
             chaos_neon_mode: false,
+            gameplay_features: Vec::new(),
+            best_wpm: 0.0,
         }
     }
 }
@@ -143,6 +148,10 @@ impl Settings {
                     .unwrap_or_else(|| "english200".into())
             };
         }
+        self.gameplay_features = normalize_features(&self.gameplay_features);
+        if !self.best_wpm.is_finite() || self.best_wpm < 0.0 {
+            self.best_wpm = 0.0;
+        }
     }
 
     pub fn enabled_chaos_count(&self) -> usize {
@@ -163,6 +172,10 @@ impl Settings {
         .into_iter()
         .filter(|enabled| *enabled)
         .count()
+    }
+
+    pub fn gameplay_enabled(&self, feature: GameplayFeature) -> bool {
+        self.gameplay_features.contains(&feature)
     }
 }
 
@@ -211,6 +224,7 @@ enum SettingItem {
     ChaosHauntedMode,
     ChaosBlackoutMode,
     ChaosNeonMode,
+    Gameplay(GameplayFeature),
     Language,
 }
 
@@ -220,7 +234,7 @@ enum Step {
     Next,
 }
 
-const SELECTABLE_ITEMS: [SettingItem; 25] = [
+const BASE_SELECTABLE_ITEMS: [SettingItem; 24] = [
     SettingItem::SuddenDeath,
     SettingItem::NoBacktrack,
     SettingItem::NoBackspace,
@@ -245,7 +259,6 @@ const SELECTABLE_ITEMS: [SettingItem; 25] = [
     SettingItem::ChaosHauntedMode,
     SettingItem::ChaosBlackoutMode,
     SettingItem::ChaosNeonMode,
-    SettingItem::Language,
 ];
 
 impl SettingsScreen {
@@ -275,7 +288,7 @@ impl SettingsScreen {
                 SettingsAction::None
             }
             KeyCode::Down => {
-                self.selected = (self.selected + 1).min(SELECTABLE_ITEMS.len() - 1);
+                self.selected = (self.selected + 1).min(selectable_item_count() - 1);
                 SettingsAction::None
             }
             KeyCode::Char(' ') => self.toggle_selected(settings),
@@ -331,6 +344,7 @@ impl SettingsScreen {
             SettingItem::ChaosHauntedMode => toggle(&mut settings.chaos_haunted_mode),
             SettingItem::ChaosBlackoutMode => toggle(&mut settings.chaos_blackout_mode),
             SettingItem::ChaosNeonMode => toggle(&mut settings.chaos_neon_mode),
+            SettingItem::Gameplay(feature) => toggle_gameplay_feature(settings, feature),
             SettingItem::RaceAddress => {
                 self.editing_race_address = true;
                 SettingsAction::None
@@ -358,7 +372,8 @@ impl SettingsScreen {
             | SettingItem::ChaosSpeedDemonMode
             | SettingItem::ChaosHauntedMode
             | SettingItem::ChaosBlackoutMode
-            | SettingItem::ChaosNeonMode => self.activate_selected(settings),
+            | SettingItem::ChaosNeonMode
+            | SettingItem::Gameplay(_) => self.activate_selected(settings),
             _ => SettingsAction::None,
         }
     }
@@ -401,12 +416,43 @@ impl SettingsScreen {
     }
 
     fn selected_item(&self) -> SettingItem {
-        SELECTABLE_ITEMS[self.selected]
+        selectable_item(self.selected)
     }
+}
+
+fn selectable_item_count() -> usize {
+    BASE_SELECTABLE_ITEMS.len() + ALL_GAMEPLAY_FEATURES.len() + 1
+}
+
+fn selectable_item(index: usize) -> SettingItem {
+    if index < BASE_SELECTABLE_ITEMS.len() {
+        return BASE_SELECTABLE_ITEMS[index];
+    }
+
+    let feature_index = index - BASE_SELECTABLE_ITEMS.len();
+    if feature_index < ALL_GAMEPLAY_FEATURES.len() {
+        return SettingItem::Gameplay(ALL_GAMEPLAY_FEATURES[feature_index]);
+    }
+
+    SettingItem::Language
 }
 
 fn toggle(value: &mut bool) -> SettingsAction {
     *value = !*value;
+    SettingsAction::Changed
+}
+
+fn toggle_gameplay_feature(settings: &mut Settings, feature: GameplayFeature) -> SettingsAction {
+    if let Some(index) = settings
+        .gameplay_features
+        .iter()
+        .position(|enabled| *enabled == feature)
+    {
+        settings.gameplay_features.remove(index);
+    } else {
+        settings.gameplay_features.push(feature);
+        settings.gameplay_features = normalize_features(&settings.gameplay_features);
+    }
     SettingsAction::Changed
 }
 
@@ -723,6 +769,27 @@ fn settings_lines(
         screen,
         theme,
     );
+
+    push_section(&mut lines, "GAMEPLAY", theme);
+    lines.push(Line::from(Span::styled(
+        format!("Best WPM: {:.1}", settings.best_wpm),
+        theme.results_overview,
+    )));
+    for feature in ALL_GAMEPLAY_FEATURES {
+        push_item(
+            &mut lines,
+            format!(
+                "{} {} - {}",
+                checkbox(settings.gameplay_enabled(feature)),
+                feature.label(),
+                feature.description()
+            ),
+            &mut selectable,
+            &mut selected_line,
+            screen,
+            theme,
+        );
+    }
 
     push_section(&mut lines, "LANGUAGE", theme);
     let language = if languages.is_empty() {

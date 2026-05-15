@@ -1,4 +1,7 @@
-use crate::config::Theme;
+use crate::{
+    config::Theme,
+    gameplay::{GameplayFeature, WordKind},
+};
 
 use super::test::{results, RaceOutcome, Test, TestWord};
 
@@ -7,6 +10,7 @@ use crossterm::event::KeyEvent;
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
     symbols::Marker,
     text::{Line, Span, Text},
     widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph, Widget},
@@ -19,6 +23,42 @@ const WPM_PER_CPS: f64 = 12.0;
 
 // Width of the moving average window for the WPM chart
 const WPM_SMA_WIDTH: usize = 10;
+pub const POWER_BURST_LIFETIME_MS: u128 = 650;
+
+const POWER_PARTICLE_DIRECTIONS: [(i16, i16); 16] = [
+    (0, -1),
+    (1, -1),
+    (2, -1),
+    (2, 0),
+    (2, 1),
+    (1, 1),
+    (0, 1),
+    (-1, 1),
+    (-2, 1),
+    (-2, 0),
+    (-2, -1),
+    (-1, -1),
+    (0, -2),
+    (1, -2),
+    (0, 2),
+    (-1, 2),
+];
+const POWER_PARTICLE_SYMBOLS: [&str; 6] = ["*", "+", "x", ".", "#", "o"];
+const POWER_PARTICLE_COLORS: [Color; 6] = [
+    Color::Rgb(0xff, 0xd7, 0x00),
+    Color::Rgb(0xff, 0x66, 0x00),
+    Color::Rgb(0xff, 0x2d, 0x55),
+    Color::Rgb(0x00, 0xd7, 0xff),
+    Color::Rgb(0x7c, 0xff, 0x4f),
+    Color::Rgb(0xff, 0x7a, 0xff),
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PowerBurst {
+    pub seed: u64,
+    pub started_at: Instant,
+    pub combo: usize,
+}
 
 #[derive(Clone)]
 struct SizedBlock<'a> {
@@ -85,6 +125,7 @@ pub struct TestRenderEffects {
     pub blackout_prompt: bool,
     pub time_multiplier: f64,
     pub accelerated_elapsed: Option<Duration>,
+    pub power_burst: Option<PowerBurst>,
 }
 
 impl Default for TestRenderEffects {
@@ -98,6 +139,7 @@ impl Default for TestRenderEffects {
             blackout_prompt: false,
             time_multiplier: 1.0,
             accelerated_elapsed: None,
+            power_burst: None,
         }
     }
 }
@@ -105,6 +147,171 @@ impl Default for TestRenderEffects {
 pub struct TestView<'a> {
     pub test: &'a Test,
     pub effects: TestRenderEffects,
+}
+
+pub struct RaceLobbyView<'a> {
+    pub room_code: &'a str,
+    pub public_addr: &'a str,
+    pub invite_command: &'a str,
+    pub status: &'a str,
+    pub spinner: &'a str,
+    pub cancel_label: &'a str,
+    pub error: Option<&'a str>,
+}
+
+impl ThemedWidget for RaceLobbyView<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer, theme: &Theme) {
+        buf.set_style(area, theme.default);
+
+        let lobby_area = centered_rect(area, 49, 12);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(theme.border_type)
+            .border_style(theme.input_border);
+        let inner = block.inner(lobby_area);
+        block.render(lobby_area, buf);
+
+        let status = if let Some(error) = self.error {
+            error.to_string()
+        } else if self.spinner.is_empty() {
+            self.status.to_string()
+        } else {
+            format!("{} {}", self.status, self.spinner)
+        };
+        let status_style = if self.error.is_some() {
+            theme.prompt_incorrect
+        } else {
+            theme.results_overview
+        };
+
+        let lines = Text::from(vec![
+            Line::from(Span::styled("RACE LOBBY - HOSTING", theme.title)),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Room code : ", theme.results_overview),
+                Span::styled(self.room_code.to_string(), theme.results_timer),
+            ]),
+            Line::from(vec![
+                Span::styled("Public    : ", theme.results_overview),
+                Span::raw(self.public_addr.to_string()),
+            ]),
+            Line::from("Send this to your friend:"),
+            Line::from(""),
+            Line::from(Span::styled(
+                self.invite_command.to_string(),
+                theme.prompt_current_untyped,
+            )),
+            Line::from(""),
+            Line::from(Span::styled(status, status_style)),
+            Line::from(Span::styled(
+                self.cancel_label.to_string(),
+                theme.results_restart_prompt,
+            )),
+        ]);
+
+        Paragraph::new(lines).render(inner, buf);
+    }
+}
+
+pub struct JoinRaceView<'a> {
+    pub input: &'a str,
+    pub error: Option<&'a str>,
+}
+
+impl ThemedWidget for JoinRaceView<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer, theme: &Theme) {
+        buf.set_style(area, theme.default);
+
+        let join_area = centered_rect(area, 49, 13);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(theme.border_type)
+            .border_style(theme.input_border);
+        let inner = block.inner(join_area);
+        block.render(join_area, buf);
+
+        let mut lines = vec![
+            Line::from(Span::styled("JOIN A RACE", theme.title)),
+            Line::from(""),
+            Line::from("Paste the connection string"),
+            Line::from("your friend sent you:"),
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("> {}_", self.input),
+                theme.prompt_current_untyped,
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Press Enter to connect",
+                theme.results_overview,
+            )),
+            Line::from(Span::styled(
+                "Press Esc to go back",
+                theme.results_restart_prompt,
+            )),
+        ];
+
+        if let Some(error) = self.error {
+            lines.push(Line::from(Span::styled(
+                error.to_string(),
+                theme.prompt_incorrect,
+            )));
+        }
+
+        Paragraph::new(Text::from(lines)).render(inner, buf);
+    }
+}
+
+pub struct JoiningRaceView<'a> {
+    pub addr: &'a str,
+    pub room_code: &'a str,
+    pub spinner: &'a str,
+}
+
+impl ThemedWidget for JoiningRaceView<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer, theme: &Theme) {
+        buf.set_style(area, theme.default);
+
+        let joining_area = centered_rect(area, 49, 10);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(theme.border_type)
+            .border_style(theme.input_border);
+        let inner = block.inner(joining_area);
+        block.render(joining_area, buf);
+
+        let lines = Text::from(vec![
+            Line::from(Span::styled("JOINING RACE", theme.title)),
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("Connecting to {}... {}", self.addr, self.spinner),
+                theme.results_overview,
+            )),
+            Line::from(vec![
+                Span::styled("Room code: ", theme.results_overview),
+                Span::styled(self.room_code.to_string(), theme.results_timer),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Press Esc to cancel",
+                theme.results_restart_prompt,
+            )),
+        ]);
+
+        Paragraph::new(lines).render(inner, buf);
+    }
+}
+
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
 }
 
 impl ThemedWidget for &Test {
@@ -141,20 +348,23 @@ impl ThemedWidget for TestView<'_> {
         };
 
         let mut input_title = vec![Span::styled("Input", theme.title)];
-        if let Some(wpm) = test.live_wpm_at(Instant::now()) {
+        let now = Instant::now();
+        if let Some(wpm) = test.live_wpm_at(now) {
             input_title.push(Span::raw(" "));
             input_title.push(Span::styled(
                 format!("WPM {:.1}", wpm),
                 theme.results_overview,
             ));
         }
-        let now = Instant::now();
         let remaining = if let Some(elapsed) = effects.accelerated_elapsed {
             test.time_remaining_after_elapsed(elapsed)
-        } else if effects.time_multiplier <= 1.0 {
+        } else if effects.time_multiplier * test.visual_elapsed_multiplier() <= 1.0 {
             test.time_remaining_at(now)
         } else {
-            test.time_remaining_at_with_multiplier(now, effects.time_multiplier)
+            test.time_remaining_at_with_multiplier(
+                now,
+                effects.time_multiplier * test.visual_elapsed_multiplier(),
+            )
         };
         if let Some(remaining) = remaining {
             let remaining_seconds = remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
@@ -163,6 +373,10 @@ impl ThemedWidget for TestView<'_> {
                 format!("Time {}s", remaining_seconds),
                 theme.results_timer,
             ));
+        }
+        for part in test.gameplay_status_parts(now) {
+            input_title.push(Span::raw(" "));
+            input_title.push(Span::styled(part, theme.results_timer));
         }
 
         // Sections
@@ -189,7 +403,7 @@ impl ThemedWidget for TestView<'_> {
             target_block.render(chunks[1], buf);
         } else {
             let target_lines: Vec<Line> = {
-                let words = words_to_spans(&test.words, test.current_word, theme, effects);
+                let words = words_to_spans(test, theme, effects, now);
 
                 let mut lines: Vec<Line> = Vec::new();
                 let mut current_line: Vec<Span> = Vec::new();
@@ -233,7 +447,131 @@ impl ThemedWidget for TestView<'_> {
             );
             race.render(chunks[2], buf);
         }
+
+        render_power_mode_effect(test, effects.power_burst, area, buf, now);
     }
+}
+
+fn render_power_mode_effect(
+    test: &Test,
+    burst: Option<PowerBurst>,
+    bounds: Rect,
+    buf: &mut Buffer,
+    now: Instant,
+) {
+    if !test.feature_enabled(GameplayFeature::PowerMode) || bounds.width < 6 || bounds.height < 4 {
+        return;
+    }
+
+    let Some(burst) = burst else {
+        return;
+    };
+
+    let age_ms = now.saturating_duration_since(burst.started_at).as_millis();
+    if age_ms >= POWER_BURST_LIFETIME_MS {
+        return;
+    }
+
+    let (origin_x, origin_y) = power_burst_origin(burst.seed, bounds);
+
+    draw_power_particles(burst, origin_x, origin_y, bounds, buf, age_ms);
+    draw_power_combo_label(burst, origin_x, origin_y, bounds, buf, age_ms);
+}
+
+fn power_burst_origin(seed: u64, bounds: Rect) -> (u16, u16) {
+    let safe_x = bounds.x.saturating_add(1);
+    let safe_y = bounds.y.saturating_add(1);
+    let safe_width = bounds.width.saturating_sub(2).max(1);
+    let safe_height = bounds.height.saturating_sub(2).max(1);
+    let x = safe_x + (mix(seed) % u64::from(safe_width)) as u16;
+    let y = safe_y + (mix(seed.rotate_left(17)) % u64::from(safe_height)) as u16;
+
+    (x, y)
+}
+
+fn draw_power_combo_label(
+    burst: PowerBurst,
+    origin_x: u16,
+    origin_y: u16,
+    bounds: Rect,
+    buf: &mut Buffer,
+    age_ms: u128,
+) {
+    let label = format!("{}x", burst.combo);
+    let label_width = Line::from(label.as_str()).width() as u16;
+    let min_start_x = bounds.x.saturating_add(1);
+    let max_start_x = bounds.right().saturating_sub(1 + label_width);
+    let label_x = if max_start_x <= min_start_x {
+        min_start_x
+    } else {
+        origin_x
+            .saturating_sub(label_width / 2)
+            .clamp(min_start_x, max_start_x)
+    };
+    let float = (age_ms / 180) as u16;
+    let label_y = origin_y.saturating_sub(float).clamp(
+        bounds.y.saturating_add(1),
+        bounds.bottom().saturating_sub(2),
+    );
+    let color = POWER_PARTICLE_COLORS[particle_index(
+        burst.seed.rotate_left(11),
+        burst.combo,
+        POWER_PARTICLE_COLORS.len(),
+    )];
+    let style = Style::default().fg(color).add_modifier(Modifier::BOLD);
+    let span = Span::styled(label, style);
+    let max_width = bounds.right().saturating_sub(1).saturating_sub(label_x);
+
+    buf.set_span(label_x, label_y, &span, max_width);
+}
+
+fn draw_power_particles(
+    burst: PowerBurst,
+    origin_x: u16,
+    origin_y: u16,
+    bounds: Rect,
+    buf: &mut Buffer,
+    age_ms: u128,
+) {
+    let particle_count = (8 + burst.combo.min(8)).min(POWER_PARTICLE_DIRECTIONS.len());
+    let radius = 1 + (age_ms / 120) as i16;
+    let vertical_radius = (radius / 2).max(1);
+
+    for index in 0..particle_count {
+        let direction_index = particle_index(burst.seed, index, POWER_PARTICLE_DIRECTIONS.len());
+        let (dx, dy) = POWER_PARTICLE_DIRECTIONS[direction_index];
+        let horizontal = radius + (index % 3) as i16;
+        let vertical = vertical_radius + (index % 2) as i16;
+        let x = origin_x as i16 + dx.signum() * horizontal + dx / 2;
+        let y = origin_y as i16 + dy.signum() * vertical;
+
+        if x < 0 || y < 0 || !rect_contains(bounds, x as u16, y as u16) {
+            continue;
+        }
+
+        let symbol = POWER_PARTICLE_SYMBOLS[particle_index(
+            burst.seed ^ age_ms as u64,
+            index,
+            POWER_PARTICLE_SYMBOLS.len(),
+        )];
+        let color = POWER_PARTICLE_COLORS[particle_index(
+            burst.seed.rotate_left(7),
+            index,
+            POWER_PARTICLE_COLORS.len(),
+        )];
+        let style = Style::default().fg(color).add_modifier(Modifier::BOLD);
+        buf.get_mut(x as u16, y as u16)
+            .set_symbol(symbol)
+            .set_style(style);
+    }
+}
+
+fn particle_index(seed: u64, index: usize, len: usize) -> usize {
+    (mix(seed ^ (index as u64).wrapping_mul(0x9E37_79B9)) as usize) % len
+}
+
+fn rect_contains(rect: Rect, x: u16, y: u16) -> bool {
+    x >= rect.x && x < rect.right() && y >= rect.y && y < rect.bottom()
 }
 
 /// Builds one text progress bar line for race mode.
@@ -250,9 +588,9 @@ fn race_progress_line(
     let empty = BAR_WIDTH.saturating_sub(filled);
     Line::from(vec![Span::styled(
         format!(
-            "{label:<8} [{}{}] {:>3}%",
-            "#".repeat(filled),
-            "-".repeat(empty),
+            "{label:<8} {}{} {:>3}%",
+            "█".repeat(filled),
+            "░".repeat(empty),
             percent
         ),
         style,
@@ -277,24 +615,54 @@ fn apply_drunk_offset(mut lines: Vec<Line<'static>>, offset: i16) -> Vec<Line<'s
 }
 
 fn words_to_spans(
-    words: &[TestWord],
-    current_word: usize,
+    test: &Test,
     theme: &Theme,
     effects: TestRenderEffects,
+    now: Instant,
 ) -> Vec<Vec<Span<'static>>> {
     let mut spans = Vec::new();
     let mut visual_index = 0usize;
+    let current_word = test.current_word;
+    let mut word_indices: Vec<usize> = (0..test.words.len()).collect();
 
-    for (word_index, word) in words.iter().enumerate() {
+    if test.feature_enabled(GameplayFeature::WordSwapTrick)
+        && test
+            .started_at
+            .is_some_and(|started| now.saturating_duration_since(started).as_secs() % 6 >= 3)
+    {
+        for pair_start in ((current_word + 1)..word_indices.len()).step_by(2) {
+            if pair_start + 1 < word_indices.len() {
+                word_indices.swap(pair_start, pair_start + 1);
+            }
+        }
+    }
+
+    for word_index in word_indices {
+        if test.feature_enabled(GameplayFeature::OneWordAtATime) && word_index != current_word {
+            continue;
+        }
+
+        let word = &test.words[word_index];
         let parts = if word_index < current_word {
-            split_typed_word(word)
+            if test.feature_enabled(GameplayFeature::NegativeSpaceMode) {
+                vec![(" ".repeat(word.prompt().chars().count()), Status::Untyped)]
+            } else {
+                split_typed_word(
+                    word,
+                    test.feature_enabled(GameplayFeature::DisappearingText),
+                )
+            }
         } else if word_index == current_word {
-            split_current_word(word)
+            split_current_word(
+                word,
+                test.feature_enabled(GameplayFeature::DisappearingText),
+            )
         } else {
-            vec![(word.text.clone(), Status::Untyped)]
+            vec![(word.prompt().to_string(), Status::Untyped)]
         };
         spans.push(word_parts_to_spans(
             parts,
+            word.kind,
             theme,
             effects,
             word_index >= current_word,
@@ -302,7 +670,7 @@ fn words_to_spans(
         ));
     }
 
-    if effects.mirror_prompt {
+    if effects.mirror_prompt || test.feature_enabled(GameplayFeature::ReverseSentence) {
         mirror_words(spans)
     } else {
         spans
@@ -321,7 +689,7 @@ enum Status {
     Overtyped,
 }
 
-fn split_current_word(word: &TestWord) -> Vec<(String, Status)> {
+fn split_current_word(word: &TestWord, disappearing_text: bool) -> Vec<(String, Status)> {
     let mut parts = Vec::new();
     let mut cur_string = String::new();
     let mut cur_status = Status::Untyped;
@@ -336,15 +704,20 @@ fn split_current_word(word: &TestWord) -> Vec<(String, Status)> {
                 _ => Status::CurrentIncorrect,
             },
         };
+        let shown = if disappearing_text && status == Status::CurrentCorrect {
+            ' '
+        } else {
+            tc
+        };
 
         if status == cur_status {
-            cur_string.push(tc);
+            cur_string.push(shown);
         } else {
             if !cur_string.is_empty() {
                 parts.push((cur_string, cur_status));
                 cur_string = String::new();
             }
-            cur_string.push(tc);
+            cur_string.push(shown);
             cur_status = status;
 
             // first currentuntyped is cursor
@@ -364,7 +737,7 @@ fn split_current_word(word: &TestWord) -> Vec<(String, Status)> {
     parts
 }
 
-fn split_typed_word(word: &TestWord) -> Vec<(String, Status)> {
+fn split_typed_word(word: &TestWord, disappearing_text: bool) -> Vec<(String, Status)> {
     let mut parts = Vec::new();
     let mut cur_string = String::new();
     let mut cur_status = Status::Untyped;
@@ -379,15 +752,20 @@ fn split_typed_word(word: &TestWord) -> Vec<(String, Status)> {
                 _ => Status::Incorrect,
             },
         };
+        let shown = if disappearing_text && status == Status::Correct {
+            ' '
+        } else {
+            tc
+        };
 
         if status == cur_status {
-            cur_string.push(tc);
+            cur_string.push(shown);
         } else {
             if !cur_string.is_empty() {
                 parts.push((cur_string, cur_status));
                 cur_string = String::new();
             }
-            cur_string.push(tc);
+            cur_string.push(shown);
             cur_status = status;
         }
     }
@@ -404,6 +782,7 @@ fn split_typed_word(word: &TestWord) -> Vec<(String, Status)> {
 
 fn word_parts_to_spans(
     parts: Vec<(String, Status)>,
+    kind: WordKind,
     theme: &Theme,
     effects: TestRenderEffects,
     apply_chaos: bool,
@@ -411,7 +790,7 @@ fn word_parts_to_spans(
 ) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     for (text, status) in parts {
-        let style = match status {
+        let mut style = match status {
             Status::Correct => theme.prompt_correct,
             Status::Incorrect => theme.prompt_incorrect,
             Status::Untyped => theme.prompt_untyped,
@@ -420,6 +799,14 @@ fn word_parts_to_spans(
             Status::CurrentIncorrect => theme.prompt_current_incorrect,
             Status::Cursor => theme.prompt_current_untyped.patch(theme.prompt_cursor),
             Status::Overtyped => theme.prompt_incorrect,
+        };
+        style = match kind {
+            WordKind::Penalty => style.patch(theme.prompt_incorrect),
+            WordKind::Bonus => style.patch(theme.results_timer),
+            WordKind::DoublePoints | WordKind::Boss | WordKind::ComboBreaker => {
+                style.patch(theme.results_overview)
+            }
+            WordKind::Normal => style,
         };
 
         let text = if apply_chaos && is_untyped_status(status) {
@@ -534,10 +921,7 @@ impl ThemedWidget for &results::Results {
         // Sections
         let mut overview_text = Text::styled("", theme.results_overview);
         overview_text.extend([
-            Line::from(format!(
-                "Adjusted WPM: {:.1}",
-                self.timing.overall_cps * WPM_PER_CPS * f64::from(self.accuracy.overall)
-            )),
+            Line::from(format!("Adjusted WPM: {:.1}", self.adjusted_wpm())),
             Line::from(format!(
                 "Accuracy: {:.1}%",
                 f64::from(self.accuracy.overall) * 100f64
@@ -546,17 +930,29 @@ impl ThemedWidget for &results::Results {
                 "Raw WPM: {:.1}",
                 self.timing.overall_cps * WPM_PER_CPS
             )),
+            Line::from(format!(
+                "Gameplay Multiplier: x{:.2}",
+                self.gameplay_multiplier
+            )),
             Line::from(format!("Correct Keypresses: {}", self.accuracy.overall)),
         ]);
+        overview_text.extend(self.gameplay_summary.iter().cloned().map(Line::from));
         if let Some(race) = &self.race_progress {
             let message = race.message.clone().unwrap_or_else(|| match race.outcome {
-                Some(RaceOutcome::Win) => "Race: You win".into(),
-                Some(RaceOutcome::Lose) => "Race: You lose".into(),
-                Some(RaceOutcome::Tie) => "Race: Tie".into(),
+                Some(RaceOutcome::Win) => "You won!".into(),
+                Some(RaceOutcome::Lose) => "Opponent won!".into(),
+                Some(RaceOutcome::Tie) => "Tie!".into(),
                 Some(RaceOutcome::Disconnected) => "Race: Opponent disconnected".into(),
                 None => "Race: Complete".into(),
             });
             overview_text.extend([Line::from(message)]);
+            if race.you_wpm.is_some() || race.opponent_wpm.is_some() {
+                overview_text.extend([Line::from(format!(
+                    "Your WPM: {:.0}  |  Opponent WPM: {:.0}",
+                    race.you_wpm.unwrap_or_default(),
+                    race.opponent_wpm.unwrap_or_default()
+                ))]);
+            }
         }
         let overview = Paragraph::new(overview_text).block(
             Block::default()
@@ -667,6 +1063,17 @@ impl ThemedWidget for &results::Results {
 mod tests {
     use super::*;
 
+    #[test]
+    fn power_burst_origin_stays_inside_screen_bounds() {
+        let bounds = Rect::new(10, 5, 40, 12);
+        let (x, y) = power_burst_origin(12345, bounds);
+
+        assert!(x > bounds.x);
+        assert!(x < bounds.right().saturating_sub(1));
+        assert!(y > bounds.y);
+        assert!(y < bounds.bottom().saturating_sub(1));
+    }
+
     mod split_words {
         use super::Status::*;
         use super::*;
@@ -712,7 +1119,7 @@ mod tests {
 
             for case in cases {
                 let (word, expected) = setup(case);
-                let got = split_typed_word(&word);
+                let got = split_typed_word(&word, false);
                 assert_eq!(got, expected);
             }
         }
@@ -749,7 +1156,7 @@ mod tests {
 
             for case in cases {
                 let (word, expected) = setup(case);
-                let got = split_current_word(&word);
+                let got = split_current_word(&word, false);
                 assert_eq!(got, expected);
             }
         }

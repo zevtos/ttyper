@@ -1,80 +1,165 @@
+use crate::tunnel::{self, BoreTunnel};
+
+use rand::Rng;
 use std::{
     io::{self, BufRead, BufReader, Write},
     net::{TcpListener, TcpStream},
-    sync::mpsc::{self, Receiver},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver},
+        Arc, Mutex,
+    },
     thread,
+    time::{Duration, Instant},
 };
 
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(3);
+const LOCAL_RACE_PORT: u16 = 7878;
+const PUBLIC_TUNNEL_HOST: &str = "bore.pub";
+
 /// Event received from the opponent during a race.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub enum RaceEvent {
     OpponentProgress(usize),
-    OpponentFinished(usize),
+    OpponentFinished { wpm: f64, accuracy: f64 },
     Disconnected(String),
+}
+
+/// Result produced by the host lobby background accept loop.
+pub enum LobbyEvent {
+    OpponentConnected(RaceSession),
+    Cancelled,
+    Failed(String),
+}
+
+/// Parsed race join argument.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RaceInvite {
+    pub addr: String,
+    pub room_code: String,
+}
+
+/// Host-side lobby data and resources.
+pub struct HostLobby {
+    room_code: String,
+    public_addr: String,
+    invite_command: String,
+    receiver: Receiver<LobbyEvent>,
+    cancel: Arc<AtomicBool>,
+    tunnel: Option<BoreTunnel>,
+}
+
+impl HostLobby {
+    /// Creates a hosted lobby, starts bore, and begins waiting for the first valid opponent.
+    pub fn start(bind_addr: &str, words: Vec<String>) -> io::Result<Self> {
+        let listener = TcpListener::bind(bind_addr)?;
+        listener.set_nonblocking(true)?;
+
+        let room_code = generate_room_code();
+        let bore_path = tunnel::ensure_bore_installed()?;
+        let tunnel = tunnel::spawn_bore(&bore_path, LOCAL_RACE_PORT, PUBLIC_TUNNEL_HOST)?;
+        let public_addr = tunnel.public_addr().to_string();
+        let invite_command = format!("ttyper --race {public_addr}#{room_code}");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = mpsc::channel();
+
+        spawn_host_accept_loop(
+            listener,
+            room_code.clone(),
+            words,
+            Arc::clone(&cancel),
+            sender,
+        );
+
+        Ok(Self {
+            room_code,
+            public_addr,
+            invite_command,
+            receiver,
+            cancel,
+            tunnel: Some(tunnel),
+        })
+    }
+
+    pub fn room_code(&self) -> &str {
+        &self.room_code
+    }
+
+    pub fn public_addr(&self) -> &str {
+        &self.public_addr
+    }
+
+    pub fn invite_command(&self) -> &str {
+        &self.invite_command
+    }
+
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::SeqCst);
+    }
+
+    pub fn poll(&mut self) -> Option<LobbyEvent> {
+        self.receiver.try_recv().ok()
+    }
+
+    pub fn take_tunnel(&mut self) -> Option<BoreTunnel> {
+        self.tunnel.take()
+    }
+}
+
+impl Drop for HostLobby {
+    fn drop(&mut self) {
+        self.cancel();
+    }
 }
 
 /// Active TCP race connection used by the main event loop.
 pub struct RaceSession {
-    writer: TcpStream,
+    writer: Arc<Mutex<TcpStream>>,
     events: Receiver<RaceEvent>,
+    closed: Arc<AtomicBool>,
+    tunnel: Option<BoreTunnel>,
 }
 
 impl RaceSession {
-    /// Starts the background reader thread for an established race stream.
+    /// Starts reader and heartbeat threads for an established race stream.
     fn new(stream: TcpStream) -> io::Result<Self> {
         stream.set_nodelay(true)?;
         let reader = stream.try_clone()?;
+        let writer = Arc::new(Mutex::new(stream));
         let (sender, events) = mpsc::channel();
+        let closed = Arc::new(AtomicBool::new(false));
+        let last_pong = Arc::new(Mutex::new(Instant::now()));
 
-        thread::spawn(move || {
-            let mut reader = BufReader::new(reader);
-            loop {
-                let mut line = String::new();
-                match reader.read_line(&mut line) {
-                    Ok(0) => {
-                        let _ = sender.send(RaceEvent::Disconnected(
-                            "opponent disconnected from the race".into(),
-                        ));
-                        break;
-                    }
-                    Ok(_) => {
-                        trim_protocol_line(&mut line);
-                        let Some(event) = parse_peer_event(&line) else {
-                            let _ = sender.send(RaceEvent::Disconnected(format!(
-                                "received invalid race message: {line}"
-                            )));
-                            break;
-                        };
-                        if sender.send(event).is_err() {
-                            break;
-                        }
-                    }
-                    Err(error) => {
-                        let _ = sender.send(RaceEvent::Disconnected(format!(
-                            "race connection failed: {error}"
-                        )));
-                        break;
-                    }
-                }
-            }
-        });
+        spawn_reader_thread(
+            reader,
+            Arc::clone(&writer),
+            sender.clone(),
+            Arc::clone(&closed),
+            Arc::clone(&last_pong),
+        );
+        spawn_heartbeat_thread(writer.clone(), sender, Arc::clone(&closed), last_pong);
 
         Ok(Self {
-            writer: stream,
+            writer,
             events,
+            closed,
+            tunnel: None,
         })
+    }
+
+    pub fn keep_tunnel(&mut self, tunnel: BoreTunnel) {
+        self.tunnel = Some(tunnel);
     }
 
     /// Sends the local completed-word index to the opponent.
     pub fn send_progress(&mut self, word_index: usize) -> io::Result<()> {
-        writeln!(self.writer, "PROGRESS {word_index}")?;
-        self.writer.flush()
+        write_protocol_line(&self.writer, &format!("PROGRESS {word_index}"))
     }
 
-    /// Sends the local finish signal and final completed-word index.
-    pub fn send_finish(&mut self, word_index: usize) -> io::Result<()> {
-        writeln!(self.writer, "FINISH {word_index}")?;
-        self.writer.flush()
+    /// Sends the local finish signal and final metrics.
+    pub fn send_finish(&mut self, wpm: f64, accuracy: f64) -> io::Result<()> {
+        write_protocol_line(&self.writer, &format!("FINISH {wpm:.2} {accuracy:.2}"))
     }
 
     /// Drains all queued network events without blocking the UI loop.
@@ -87,23 +172,46 @@ impl RaceSession {
     }
 }
 
-/// Hosts a race, sends the generated words, and waits for one client.
-pub fn host(addr: &str, words: &[String]) -> io::Result<RaceSession> {
-    let listener = TcpListener::bind(addr)?;
-    let (mut stream, _) = listener.accept()?;
-    send_word_list(&mut stream, words)?;
-    writeln!(stream, "START")?;
-    stream.flush()?;
-    RaceSession::new(stream)
+impl Drop for RaceSession {
+    fn drop(&mut self) {
+        self.closed.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Connects to a race host and receives the authoritative word list.
-pub fn client(addr: &str) -> io::Result<(Vec<String>, RaceSession)> {
-    let stream = TcpStream::connect(addr)?;
+pub fn client(invite: &RaceInvite) -> io::Result<(Vec<String>, RaceSession)> {
+    let mut stream = TcpStream::connect(&invite.addr)?;
     stream.set_nodelay(true)?;
+    writeln!(stream, "ROOM {}", invite.room_code)?;
+    stream.flush()?;
 
     let reader = stream.try_clone()?;
     let mut reader = BufReader::new(reader);
+    let mut status = String::new();
+    if reader.read_line(&mut status)? == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "race host closed before accepting room code",
+        ));
+    }
+    trim_protocol_line(&mut status);
+
+    match status.as_str() {
+        "OK" => {}
+        "WRONG" => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Wrong room code. Connection refused.",
+            ));
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid race room response",
+            ));
+        }
+    }
+
     let words = read_word_list(&mut reader)?;
     read_start(&mut reader)?;
     drop(reader);
@@ -111,45 +219,222 @@ pub fn client(addr: &str) -> io::Result<(Vec<String>, RaceSession)> {
     Ok((words, RaceSession::new(stream)?))
 }
 
-/// Writes the race word list in a simple newline protocol.
-fn send_word_list(stream: &mut TcpStream, words: &[String]) -> io::Result<()> {
-    writeln!(stream, "WORDS {}", words.len())?;
-    for word in words {
-        writeln!(stream, "{word}")?;
+/// Parses a race address in HOST:PORT#CODE format.
+pub fn parse_invite(input: &str) -> io::Result<RaceInvite> {
+    let (addr, room_code) = input.split_once('#').ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "race address must look like host:port#1234",
+        )
+    })?;
+
+    if addr.trim().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "race address host is empty",
+        ));
     }
+    if !is_valid_room_code(room_code) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "race room code must be exactly 4 digits",
+        ));
+    }
+
+    Ok(RaceInvite {
+        addr: addr.trim().to_string(),
+        room_code: room_code.to_string(),
+    })
+}
+
+fn spawn_host_accept_loop(
+    listener: TcpListener,
+    room_code: String,
+    words: Vec<String>,
+    cancel: Arc<AtomicBool>,
+    sender: mpsc::Sender<LobbyEvent>,
+) {
+    thread::spawn(move || loop {
+        if cancel.load(Ordering::SeqCst) {
+            let _ = sender.send(LobbyEvent::Cancelled);
+            return;
+        }
+
+        match listener.accept() {
+            Ok((mut stream, _)) => match handle_lobby_client(&mut stream, &room_code, &words) {
+                Ok(true) => match RaceSession::new(stream) {
+                    Ok(session) => {
+                        let _ = sender.send(LobbyEvent::OpponentConnected(session));
+                        return;
+                    }
+                    Err(error) => {
+                        let _ = sender.send(LobbyEvent::Failed(format!(
+                            "could not start race session: {error}"
+                        )));
+                        return;
+                    }
+                },
+                Ok(false) => {}
+                Err(error) => {
+                    let _ = sender.send(LobbyEvent::Failed(format!("race lobby failed: {error}")));
+                    return;
+                }
+            },
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => {
+                let _ = sender.send(LobbyEvent::Failed(format!(
+                    "could not accept race opponent: {error}"
+                )));
+                return;
+            }
+        }
+    });
+}
+
+fn handle_lobby_client(
+    stream: &mut TcpStream,
+    room_code: &str,
+    words: &[String],
+) -> io::Result<bool> {
+    stream.set_nodelay(true)?;
+    let reader = stream.try_clone()?;
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+    if reader.read_line(&mut line)? == 0 {
+        return Ok(false);
+    }
+    trim_protocol_line(&mut line);
+
+    if line != format!("ROOM {room_code}") {
+        writeln!(stream, "WRONG")?;
+        stream.flush()?;
+        return Ok(false);
+    }
+
+    writeln!(stream, "OK")?;
+    send_word_list(stream, words)?;
+    writeln!(stream, "START")?;
+    stream.flush()?;
+    Ok(true)
+}
+
+fn spawn_reader_thread(
+    reader: TcpStream,
+    writer: Arc<Mutex<TcpStream>>,
+    sender: mpsc::Sender<RaceEvent>,
+    closed: Arc<AtomicBool>,
+    last_pong: Arc<Mutex<Instant>>,
+) {
+    thread::spawn(move || {
+        let mut reader = BufReader::new(reader);
+        loop {
+            if closed.load(Ordering::SeqCst) {
+                break;
+            }
+
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => {
+                    let _ = sender.send(RaceEvent::Disconnected(
+                        "opponent disconnected from the race".into(),
+                    ));
+                    break;
+                }
+                Ok(_) => {
+                    trim_protocol_line(&mut line);
+                    match parse_peer_message(&line) {
+                        Some(PeerMessage::Event(event)) => {
+                            if sender.send(event).is_err() {
+                                break;
+                            }
+                        }
+                        Some(PeerMessage::Ping) => {
+                            let _ = write_protocol_line(&writer, "PONG");
+                        }
+                        Some(PeerMessage::Pong) => {
+                            if let Ok(mut last_pong) = last_pong.lock() {
+                                *last_pong = Instant::now();
+                            }
+                        }
+                        None => {
+                            let _ = sender.send(RaceEvent::Disconnected(format!(
+                                "received invalid race message: {line}"
+                            )));
+                            break;
+                        }
+                    }
+                }
+                Err(error) => {
+                    let _ = sender.send(RaceEvent::Disconnected(format!(
+                        "race connection failed: {error}"
+                    )));
+                    break;
+                }
+            }
+        }
+        closed.store(true, Ordering::SeqCst);
+    });
+}
+
+fn spawn_heartbeat_thread(
+    writer: Arc<Mutex<TcpStream>>,
+    sender: mpsc::Sender<RaceEvent>,
+    closed: Arc<AtomicBool>,
+    last_pong: Arc<Mutex<Instant>>,
+) {
+    thread::spawn(move || loop {
+        thread::sleep(HEARTBEAT_INTERVAL);
+        if closed.load(Ordering::SeqCst) {
+            break;
+        }
+
+        let timed_out = last_pong
+            .lock()
+            .map(|last_pong| last_pong.elapsed() > HEARTBEAT_TIMEOUT)
+            .unwrap_or(true);
+        if timed_out {
+            let _ = sender.send(RaceEvent::Disconnected(
+                "opponent heartbeat timed out".into(),
+            ));
+            closed.store(true, Ordering::SeqCst);
+            break;
+        }
+
+        if let Err(error) = write_protocol_line(&writer, "PING") {
+            let _ = sender.send(RaceEvent::Disconnected(format!(
+                "race heartbeat failed: {error}"
+            )));
+            closed.store(true, Ordering::SeqCst);
+            break;
+        }
+    });
+}
+
+/// Writes the race word list as a JSON array on one protocol line.
+fn send_word_list(stream: &mut TcpStream, words: &[String]) -> io::Result<()> {
+    let encoded = serde_json::to_string(words)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    writeln!(stream, "WORDS {encoded}")?;
     stream.flush()
 }
 
 /// Reads the host-provided word list from the race protocol.
 fn read_word_list<R: BufRead>(reader: &mut R) -> io::Result<Vec<String>> {
-    let mut header = String::new();
-    if reader.read_line(&mut header)? == 0 {
+    let mut line = String::new();
+    if reader.read_line(&mut line)? == 0 {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
             "race host closed before sending words",
         ));
     }
-    trim_protocol_line(&mut header);
+    trim_protocol_line(&mut line);
 
-    let count = header
+    let encoded = line
         .strip_prefix("WORDS ")
-        .and_then(|count| count.parse::<usize>().ok())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid race word header"))?;
-
-    let mut words = Vec::with_capacity(count);
-    for _ in 0..count {
-        let mut word = String::new();
-        if reader.read_line(&mut word)? == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "race host closed before sending all words",
-            ));
-        }
-        trim_protocol_line(&mut word);
-        words.push(word);
-    }
-
-    Ok(words)
+    serde_json::from_str(encoded).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 /// Reads the start signal that releases both players into the race.
@@ -173,16 +458,45 @@ fn read_start<R: BufRead>(reader: &mut R) -> io::Result<()> {
     }
 }
 
-/// Parses an opponent progress or finish message.
-fn parse_peer_event(line: &str) -> Option<RaceEvent> {
-    let (kind, value) = line.split_once(' ')?;
-    let progress = value.parse::<usize>().ok()?;
+enum PeerMessage {
+    Event(RaceEvent),
+    Ping,
+    Pong,
+}
 
+/// Parses an opponent progress, finish, or heartbeat message.
+fn parse_peer_message(line: &str) -> Option<PeerMessage> {
+    if line == "PING" {
+        return Some(PeerMessage::Ping);
+    }
+    if line == "PONG" {
+        return Some(PeerMessage::Pong);
+    }
+
+    let (kind, value) = line.split_once(' ')?;
     match kind {
-        "PROGRESS" => Some(RaceEvent::OpponentProgress(progress)),
-        "FINISH" => Some(RaceEvent::OpponentFinished(progress)),
+        "PROGRESS" => Some(PeerMessage::Event(RaceEvent::OpponentProgress(
+            value.parse::<usize>().ok()?,
+        ))),
+        "FINISH" => {
+            let mut parts = value.split_whitespace();
+            let wpm = parts.next()?.parse::<f64>().ok()?;
+            let accuracy = parts.next()?.parse::<f64>().ok()?;
+            Some(PeerMessage::Event(RaceEvent::OpponentFinished {
+                wpm,
+                accuracy,
+            }))
+        }
         _ => None,
     }
+}
+
+fn write_protocol_line(writer: &Arc<Mutex<TcpStream>>, line: &str) -> io::Result<()> {
+    let mut writer = writer
+        .lock()
+        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "race writer lock poisoned"))?;
+    writeln!(writer, "{line}")?;
+    writer.flush()
 }
 
 /// Removes protocol line endings without trimming word content.
@@ -192,32 +506,111 @@ fn trim_protocol_line(line: &mut String) {
     }
 }
 
+fn generate_room_code() -> String {
+    format!("{:04}", rand::thread_rng().gen_range(0..10_000))
+}
+
+fn is_valid_room_code(code: &str) -> bool {
+    code.len() == 4 && code.chars().all(|character| character.is_ascii_digit())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use std::time::Duration;
 
     #[test]
     fn parses_peer_progress_messages() {
-        assert_eq!(
-            parse_peer_event("PROGRESS 12"),
-            Some(RaceEvent::OpponentProgress(12))
-        );
-        assert_eq!(
-            parse_peer_event("FINISH 50"),
-            Some(RaceEvent::OpponentFinished(50))
-        );
-        assert_eq!(parse_peer_event("BAD 50"), None);
+        assert!(matches!(
+            parse_peer_message("PROGRESS 12"),
+            Some(PeerMessage::Event(RaceEvent::OpponentProgress(12)))
+        ));
+        assert!(matches!(
+            parse_peer_message("FINISH 87.50 98.25"),
+            Some(PeerMessage::Event(RaceEvent::OpponentFinished {
+                wpm: 87.5,
+                accuracy: 98.25,
+            }))
+        ));
+        assert!(matches!(
+            parse_peer_message("PING"),
+            Some(PeerMessage::Ping)
+        ));
+        assert!(matches!(
+            parse_peer_message("PONG"),
+            Some(PeerMessage::Pong)
+        ));
+        assert!(parse_peer_message("BAD 50").is_none());
     }
 
     #[test]
-    fn reads_word_list_without_trimming_word_spaces() {
-        let data = b"WORDS 2\r\nhello world \nSTART\nSTART\n";
+    fn reads_json_word_list_without_trimming_word_spaces() {
+        let data = b"WORDS [\"hello world \",\"START\"]\nSTART\n";
         let mut reader = Cursor::new(data);
 
         let words = read_word_list(&mut reader).unwrap();
         read_start(&mut reader).unwrap();
 
         assert_eq!(words, vec!["hello world ", "START"]);
+    }
+
+    #[test]
+    fn parses_race_invite_with_room_code() {
+        assert_eq!(
+            parse_invite("bore.pub:43821#4829").unwrap(),
+            RaceInvite {
+                addr: "bore.pub:43821".into(),
+                room_code: "4829".into(),
+            }
+        );
+        assert!(parse_invite("bore.pub:43821").is_err());
+        assert!(parse_invite("bore.pub:43821#abcd").is_err());
+    }
+
+    #[test]
+    fn room_code_is_four_digits() {
+        let code = generate_room_code();
+
+        assert!(is_valid_room_code(&code));
+    }
+
+    #[test]
+    fn local_room_code_handshake_syncs_words_and_progress() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = mpsc::channel();
+        let words = vec!["the".into(), "quick".into(), "brown".into()];
+
+        spawn_host_accept_loop(
+            listener,
+            "4829".into(),
+            words.clone(),
+            Arc::clone(&cancel),
+            sender,
+        );
+
+        let invite = RaceInvite {
+            addr: addr.to_string(),
+            room_code: "4829".into(),
+        };
+        let (client_words, mut client_session) = client(&invite).unwrap();
+        assert_eq!(client_words, words);
+
+        let mut host_session = match receiver.recv_timeout(Duration::from_secs(1)).unwrap() {
+            LobbyEvent::OpponentConnected(session) => session,
+            LobbyEvent::Cancelled => panic!("lobby cancelled unexpectedly"),
+            LobbyEvent::Failed(message) => panic!("{message}"),
+        };
+
+        client_session.send_progress(1).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(host_session
+            .drain_events()
+            .contains(&RaceEvent::OpponentProgress(1)));
+
+        cancel.store(true, Ordering::SeqCst);
     }
 }

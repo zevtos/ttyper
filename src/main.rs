@@ -1,13 +1,16 @@
 mod chaos;
 mod config;
+mod gameplay;
 mod race;
 mod settings;
 mod test;
+mod tunnel;
 mod ui;
 
 use chaos::ChaosState;
 use config::{theme_by_name, Config, Theme};
-use race::{RaceEvent, RaceSession};
+use gameplay::{feature_set, GameplayFeature, PreparedWord, ALL_GAMEPLAY_FEATURES};
+use race::{LobbyEvent, RaceEvent, RaceSession};
 use settings::{settings_path, Settings, SettingsAction, SettingsScreen, SettingsView};
 use test::{results::Results, RaceOutcome, Test};
 
@@ -33,13 +36,17 @@ use std::{
     fs,
     io::{self, BufRead},
     num,
-    path::PathBuf,
+    path::{Path, PathBuf},
     str,
+    sync::mpsc::{self, Receiver, TryRecvError},
+    thread,
     time::{Duration, Instant},
 };
 
 const TIME_MODE_WORD_COUNT: usize = 10_000;
-const DEFAULT_RACE_ADDR: &str = "0.0.0.0:7878";
+const DEFAULT_RACE_ADDR: &str = "127.0.0.1:7878";
+const JOIN_RACE_ERROR_MESSAGE: &str =
+    "Could not connect. Check the connection string and try again.";
 const PUNCTUATION_CHANCE: f64 = 0.2;
 const NUMBER_CHANCE: f64 = 0.15;
 const PUNCTUATION_MARKS: [char; 4] = ['.', ',', '!', '?'];
@@ -82,10 +89,10 @@ struct Opt {
     #[arg(long)]
     numbers: bool,
 
-    /// Host a race or connect to the specified race host
+    /// Host a race or connect to the specified race host and room code
     #[arg(
         long,
-        value_name = "HOST:PORT",
+        value_name = "HOST:PORT#CODE",
         num_args = 0..=1
     )]
     race: Option<Option<String>>,
@@ -118,6 +125,14 @@ struct Opt {
     #[arg(long)]
     no_backspace: bool,
 
+    /// Enable a gameplay feature by kebab-case name; repeat for multiple features
+    #[arg(long = "feature", value_enum, value_name = "FEATURE")]
+    gameplay_features: Vec<GameplayFeature>,
+
+    /// Enable every gameplay feature, including power mode
+    #[arg(long)]
+    all_gameplay_features: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -144,6 +159,8 @@ struct CliOverrides {
     no_backtrack: bool,
     sudden_death: bool,
     no_backspace: bool,
+    gameplay_features: bool,
+    all_gameplay_features: bool,
 }
 
 impl CliOverrides {
@@ -160,6 +177,8 @@ impl CliOverrides {
             no_backtrack: is_command_line_arg(matches, "no_backtrack"),
             sudden_death: is_command_line_arg(matches, "sudden_death"),
             no_backspace: is_command_line_arg(matches, "no_backspace"),
+            gameplay_features: is_command_line_arg(matches, "gameplay_features"),
+            all_gameplay_features: is_command_line_arg(matches, "all_gameplay_features"),
         }
     }
 }
@@ -205,6 +224,11 @@ impl Opt {
         }
         if !overrides.no_backspace {
             effective.no_backspace = settings.no_backspace;
+        }
+        if overrides.all_gameplay_features || effective.all_gameplay_features {
+            effective.gameplay_features = ALL_GAMEPLAY_FEATURES.to_vec();
+        } else if !overrides.gameplay_features {
+            effective.gameplay_features = settings.gameplay_features.clone();
         }
 
         effective
@@ -353,7 +377,11 @@ impl Opt {
 
     /// Number of generated words for the selected test mode.
     fn generated_word_count(&self) -> usize {
-        if self.time.is_some() {
+        if self.time.is_some()
+            || self
+                .gameplay_features
+                .contains(&GameplayFeature::EnduranceMode)
+        {
             TIME_MODE_WORD_COUNT
         } else {
             self.words.get()
@@ -436,8 +464,42 @@ enum State {
         screen: SettingsScreen,
         previous: Box<State>,
     },
+    RaceLobbyStarting {
+        receiver: Receiver<HostSetupEvent>,
+        test: Option<Test>,
+        started_at: Instant,
+        error: Option<String>,
+    },
+    RaceLobby {
+        lobby: race::HostLobby,
+        test: Option<Test>,
+        started_at: Instant,
+    },
+    JoinRace {
+        input: String,
+        error: Option<String>,
+    },
+    JoinRaceConnecting {
+        input: String,
+        invite: race::RaceInvite,
+        receiver: Receiver<JoinRaceEvent>,
+        started_at: Instant,
+    },
     Test(Test),
     Results(Results),
+}
+
+enum HostSetupEvent {
+    Ready(race::HostLobby),
+    Failed(String),
+}
+
+enum JoinRaceEvent {
+    Connected {
+        words: Vec<String>,
+        session: RaceSession,
+    },
+    Failed(String),
 }
 
 impl State {
@@ -465,6 +527,71 @@ impl State {
                             screen,
                             settings,
                             languages,
+                        }),
+                        area,
+                    );
+                })?;
+            }
+            State::RaceLobbyStarting {
+                started_at, error, ..
+            } => {
+                terminal.draw(|f| {
+                    let area = chaos.earthquake_area(f.size(), settings);
+                    f.render_widget(
+                        theme.apply_to(ui::RaceLobbyView {
+                            room_code: "----",
+                            public_addr: "Preparing tunnel...",
+                            invite_command: "Preparing invite command...",
+                            status: "Setting up race lobby...",
+                            spinner: spinner_at(*started_at),
+                            cancel_label: "Press Esc to cancel and go back",
+                            error: error.as_deref(),
+                        }),
+                        area,
+                    );
+                })?;
+            }
+            State::RaceLobby {
+                lobby, started_at, ..
+            } => {
+                terminal.draw(|f| {
+                    let area = chaos.earthquake_area(f.size(), settings);
+                    f.render_widget(
+                        theme.apply_to(ui::RaceLobbyView {
+                            room_code: lobby.room_code(),
+                            public_addr: lobby.public_addr(),
+                            invite_command: lobby.invite_command(),
+                            status: "Waiting for opponent to connect...",
+                            spinner: spinner_at(*started_at),
+                            cancel_label: "Press Esc to cancel and go back",
+                            error: None,
+                        }),
+                        area,
+                    );
+                })?;
+            }
+            State::JoinRace { input, error } => {
+                terminal.draw(|f| {
+                    let area = chaos.earthquake_area(f.size(), settings);
+                    f.render_widget(
+                        theme.apply_to(ui::JoinRaceView {
+                            input,
+                            error: error.as_deref(),
+                        }),
+                        area,
+                    );
+                })?;
+            }
+            State::JoinRaceConnecting {
+                invite, started_at, ..
+            } => {
+                terminal.draw(|f| {
+                    let area = chaos.earthquake_area(f.size(), settings);
+                    f.render_widget(
+                        theme.apply_to(ui::JoiningRaceView {
+                            addr: &invite.addr,
+                            room_code: &invite.room_code,
+                            spinner: spinner_at(*started_at),
                         }),
                         area,
                     );
@@ -503,6 +630,44 @@ impl State {
 
 struct Welcome;
 
+struct TerminalCleanup {
+    active: bool,
+}
+
+impl TerminalCleanup {
+    fn active() -> Self {
+        Self { active: true }
+    }
+
+    fn finish(&mut self) -> io::Result<()> {
+        if self.active {
+            self.active = false;
+            terminal::disable_raw_mode()?;
+            execute!(
+                io::stdout(),
+                cursor::RestorePosition,
+                cursor::Show,
+                terminal::LeaveAlternateScreen,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for TerminalCleanup {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = terminal::disable_raw_mode();
+            let _ = execute!(
+                io::stdout(),
+                cursor::RestorePosition,
+                cursor::Show,
+                terminal::LeaveAlternateScreen,
+            );
+        }
+    }
+}
+
 impl ui::ThemedWidget for Welcome {
     fn render(self, area: ratatui::layout::Rect, buf: &mut ratatui::buffer::Buffer, theme: &Theme) {
         buf.set_style(area, theme.default);
@@ -517,6 +682,14 @@ impl ui::ThemedWidget for Welcome {
             Line::from(Span::styled("ttyper", theme.title)),
             Line::from(""),
             Line::from(Span::styled("Press Enter to start", theme.results_overview)),
+            Line::from(Span::styled(
+                "Press R to host race",
+                theme.prompt_current_untyped,
+            )),
+            Line::from(Span::styled(
+                "Press J to join race",
+                theme.prompt_current_untyped,
+            )),
             Line::from(Span::styled(
                 "Press S for settings",
                 theme.prompt_current_untyped,
@@ -582,79 +755,161 @@ fn close_settings(state: &mut State) {
     }
 }
 
-fn start_test(opt: &Opt) -> io::Result<(Test, Option<RaceSession>)> {
-    let mut contents = if opt.is_race_client() {
-        Vec::new()
-    } else {
-        opt.gen_contents().unwrap_or_else(|error| {
-            eprintln!("Error: {error}");
-            std::process::exit(1);
-        })
-    };
+fn spinner_at(started_at: Instant) -> &'static str {
+    const FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
+    let index = (Instant::now()
+        .saturating_duration_since(started_at)
+        .as_millis()
+        / 150) as usize
+        % FRAMES.len();
+    FRAMES[index]
+}
 
-    let race_session = setup_race(opt, &mut contents)?;
+enum StartOutcome {
+    Test(Test, Option<RaceSession>),
+    RaceLobby { test: Test, lobby: race::HostLobby },
+}
 
+fn start_test(opt: &Opt) -> io::Result<StartOutcome> {
+    if opt.is_race_client() {
+        let addr = opt
+            .race_addr()
+            .expect("race client should have a configured address");
+        let invite = race::parse_invite(addr)?;
+        println!("Connecting to race host {}...", invite.addr);
+        let (contents, session) = race::client(&invite).map_err(|error| {
+            io::Error::new(error.kind(), format!("failed to connect to race: {error}"))
+        })?;
+        ensure_contents_not_empty(&contents);
+
+        let mut test = build_synced_race_test(contents, opt);
+        test.enable_race();
+        return Ok(StartOutcome::Test(test, Some(session)));
+    }
+
+    let contents = opt.gen_contents().unwrap_or_else(|error| {
+        eprintln!("Error: {error}");
+        std::process::exit(1);
+    });
+    ensure_contents_not_empty(&contents);
+
+    let test = build_test(contents, opt);
+    if opt.is_race_host() {
+        let race_words = test
+            .words
+            .iter()
+            .map(|word| word.text.clone())
+            .collect::<Vec<_>>();
+        let lobby = race::HostLobby::start(DEFAULT_RACE_ADDR, race_words).map_err(|error| {
+            io::Error::new(error.kind(), format!("failed to host race: {error}"))
+        })?;
+        return Ok(StartOutcome::RaceLobby { test, lobby });
+    }
+
+    Ok(StartOutcome::Test(test, None))
+}
+
+fn start_home_host_race(opt: &Opt, settings: &Settings) -> State {
+    let contents = opt.gen_contents().unwrap_or_else(|error| {
+        eprintln!("Error: {error}");
+        std::process::exit(1);
+    });
+    ensure_contents_not_empty(&contents);
+
+    let mut test = build_test(contents, opt);
+    apply_persistent_gameplay_state(&mut test, settings);
+    start_host_lobby_setup(test)
+}
+
+fn start_host_lobby_setup(test: Test) -> State {
+    let race_words = test
+        .words
+        .iter()
+        .map(|word| word.text.clone())
+        .collect::<Vec<_>>();
+    State::RaceLobbyStarting {
+        receiver: spawn_host_lobby_setup(DEFAULT_RACE_ADDR.to_string(), race_words),
+        test: Some(test),
+        started_at: Instant::now(),
+        error: None,
+    }
+}
+
+fn spawn_host_lobby_setup(bind_addr: String, words: Vec<String>) -> Receiver<HostSetupEvent> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let event = match race::HostLobby::start(&bind_addr, words) {
+            Ok(lobby) => HostSetupEvent::Ready(lobby),
+            Err(error) => HostSetupEvent::Failed(format!("failed to host race: {error}")),
+        };
+        let _ = sender.send(event);
+    });
+    receiver
+}
+
+fn spawn_join_race(invite: race::RaceInvite) -> Receiver<JoinRaceEvent> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let event = match race::client(&invite) {
+            Ok((words, session)) => JoinRaceEvent::Connected { words, session },
+            Err(_) => JoinRaceEvent::Failed(JOIN_RACE_ERROR_MESSAGE.into()),
+        };
+        let _ = sender.send(event);
+    });
+    receiver
+}
+
+fn ensure_contents_not_empty(contents: &[String]) {
     if contents.is_empty() {
         eprintln!("Error: the provided file or language contains no words to type.");
         eprintln!("If you specified a file, make sure it isn't empty.");
         std::process::exit(1);
     }
-
-    let mut test = build_test(contents, opt);
-    if race_session.is_some() {
-        test.enable_race();
-    }
-
-    Ok((test, race_session))
 }
 
 /// Builds a test using the selected CLI mode and editing options.
 fn build_test(contents: Vec<String>, opt: &Opt) -> Test {
-    match opt.time_limit() {
-        Some(time_limit) => Test::new_with_time_limit(
-            contents,
-            !opt.no_backtrack,
-            opt.sudden_death,
-            !opt.no_backspace,
-            Some(time_limit),
-        ),
-        None => Test::new(
-            contents,
-            !opt.no_backtrack,
-            opt.sudden_death,
-            !opt.no_backspace,
-        ),
-    }
+    let gameplay_features = feature_set(&opt.gameplay_features);
+    let prepared_words = gameplay::prepare_words(contents, &gameplay_features);
+    build_prepared_test(prepared_words, opt, gameplay_features)
 }
 
-/// Opens the requested race connection and replaces client contents with host words.
-fn setup_race(opt: &Opt, contents: &mut Vec<String>) -> io::Result<Option<RaceSession>> {
-    let Some(addr) = opt.race_addr() else {
-        return Ok(None);
-    };
+/// Builds a race client test from host-synchronized words without re-randomizing them.
+fn build_synced_race_test(contents: Vec<String>, opt: &Opt) -> Test {
+    let gameplay_features = feature_set(&opt.gameplay_features);
+    let prepared_words = contents.into_iter().map(PreparedWord::from).collect();
+    build_prepared_test(prepared_words, opt, gameplay_features)
+}
 
-    if opt.is_race_host() {
-        println!("Waiting for race opponent on {addr}...");
-        race::host(addr, contents)
-            .map(Some)
-            .map_err(|error| io::Error::new(error.kind(), format!("failed to host race: {error}")))
-    } else {
-        println!("Connecting to race host {addr}...");
-        let (host_contents, session) = race::client(addr).map_err(|error| {
-            io::Error::new(error.kind(), format!("failed to connect to race: {error}"))
-        })?;
-        *contents = host_contents;
-        Ok(Some(session))
-    }
+fn build_prepared_test(
+    prepared_words: Vec<PreparedWord>,
+    opt: &Opt,
+    gameplay_features: BTreeSet<GameplayFeature>,
+) -> Test {
+    Test::new_prepared(
+        prepared_words,
+        !opt.no_backtrack,
+        opt.sudden_death,
+        !opt.no_backspace,
+        opt.time_limit(),
+        gameplay_features,
+        None,
+    )
 }
 
 /// Applies queued opponent race events to the active test.
-fn apply_race_events(state: &mut State, race_session: &mut Option<RaceSession>) {
+fn apply_race_events(
+    state: &mut State,
+    race_session: &mut Option<RaceSession>,
+    settings: &mut Settings,
+    settings_path: &Path,
+) -> io::Result<()> {
     let Some(session) = race_session.as_mut() else {
-        return;
+        return Ok(());
     };
+    let events = session.drain_events();
 
-    for event in session.drain_events() {
+    for event in events {
         let mut end_race = false;
 
         if let State::Test(test) = state {
@@ -662,8 +917,11 @@ fn apply_race_events(state: &mut State, race_session: &mut Option<RaceSession>) 
                 RaceEvent::OpponentProgress(progress) => {
                     test.update_race_opponent(progress);
                 }
-                RaceEvent::OpponentFinished(progress) => {
-                    test.update_race_opponent(progress);
+                RaceEvent::OpponentFinished { wpm, accuracy } => {
+                    test.update_race_opponent(test.words.len());
+                    test.set_race_opponent_metrics(wpm, accuracy);
+                    let (local_wpm, local_accuracy) = race_metrics_from_test(test);
+                    test.set_race_local_metrics(local_wpm, local_accuracy);
                     let outcome = if test.completed_word_count() >= test.words.len() {
                         RaceOutcome::Tie
                     } else {
@@ -672,19 +930,27 @@ fn apply_race_events(state: &mut State, race_session: &mut Option<RaceSession>) 
                     test.set_race_outcome(outcome, race_outcome_message(outcome));
                     end_race = true;
                 }
-                RaceEvent::Disconnected(message) => {
-                    test.set_race_outcome(RaceOutcome::Disconnected, format!("Race: {message}"));
+                RaceEvent::Disconnected(_message) => {
+                    let (local_wpm, local_accuracy) = race_metrics_from_test(test);
+                    test.set_race_local_metrics(local_wpm, local_accuracy);
+                    test.set_race_outcome(
+                        RaceOutcome::Disconnected,
+                        "Opponent disconnected. Race ended early.",
+                    );
                     end_race = true;
                 }
             }
         }
 
         if end_race {
+            *race_session = None;
             if let State::Test(test) = state {
-                *state = State::Results(Results::from(&*test));
+                *state = results_state_from_test(&*test, settings, settings_path)?;
             }
         }
     }
+
+    Ok(())
 }
 
 /// Reports local race progress and returns true when a network error ends the race.
@@ -704,15 +970,19 @@ fn report_race_progress(
     };
 
     let result = if test.complete {
-        session.send_finish(after_progress)
+        let (wpm, accuracy) = race_metrics_from_test(test);
+        test.set_race_local_metrics(wpm, accuracy);
+        session.send_finish(wpm, accuracy)
     } else {
         session.send_progress(after_progress)
     };
 
     if let Err(error) = result {
+        let (wpm, accuracy) = race_metrics_from_test(test);
+        test.set_race_local_metrics(wpm, accuracy);
         test.set_race_outcome(
             RaceOutcome::Disconnected,
-            format!("Race: opponent disconnected ({error})"),
+            format!("Opponent disconnected. Race ended early. ({error})"),
         );
         return true;
     }
@@ -722,14 +992,17 @@ fn report_race_progress(
 
 /// Stores a local finish outcome before showing race results.
 fn finalize_local_race(test: &mut Test) {
-    let Some(race) = &test.race_progress else {
+    let Some((opponent, total)) = test.race_progress.as_ref().and_then(|race| {
+        race.outcome
+            .is_none()
+            .then_some((race.opponent, race.total))
+    }) else {
         return;
     };
-    if race.outcome.is_some() {
-        return;
-    }
 
-    let outcome = if race.opponent >= race.total {
+    let (wpm, accuracy) = race_metrics_from_test(test);
+    test.set_race_local_metrics(wpm, accuracy);
+    let outcome = if opponent >= total {
         RaceOutcome::Tie
     } else {
         RaceOutcome::Win
@@ -740,14 +1013,74 @@ fn finalize_local_race(test: &mut Test) {
 /// Returns the results-screen label for a race outcome.
 fn race_outcome_message(outcome: RaceOutcome) -> &'static str {
     match outcome {
-        RaceOutcome::Win => "Race: You win",
-        RaceOutcome::Lose => "Race: You lose",
-        RaceOutcome::Tie => "Race: Tie",
+        RaceOutcome::Win => "You won!",
+        RaceOutcome::Lose => "Opponent won!",
+        RaceOutcome::Tie => "Tie!",
         RaceOutcome::Disconnected => "Race: Opponent disconnected",
     }
 }
 
+fn race_metrics_from_test(test: &Test) -> (f64, f64) {
+    let results = Results::from(test);
+    (
+        results.adjusted_wpm(),
+        f64::from(results.accuracy.overall) * 100.0,
+    )
+}
+
+fn apply_persistent_gameplay_state(test: &mut Test, settings: &Settings) {
+    test.gameplay.ghost_best_wpm = (settings.best_wpm > 0.0).then_some(settings.best_wpm);
+}
+
+fn update_best_wpm(
+    settings: &mut Settings,
+    settings_path: &Path,
+    results: &Results,
+) -> io::Result<()> {
+    let adjusted_wpm = results.adjusted_wpm();
+    if adjusted_wpm > settings.best_wpm {
+        settings.best_wpm = adjusted_wpm;
+        settings.save_to(settings_path)?;
+    }
+    Ok(())
+}
+
+fn results_state_from_test(
+    test: &Test,
+    settings: &mut Settings,
+    settings_path: &Path,
+) -> io::Result<State> {
+    let results = Results::from(test);
+    update_best_wpm(settings, settings_path, &results)?;
+    Ok(State::Results(results))
+}
+
+fn state_from_start_outcome(
+    outcome: StartOutcome,
+    settings: &Settings,
+) -> (State, Option<RaceSession>) {
+    match outcome {
+        StartOutcome::Test(mut test, session) => {
+            apply_persistent_gameplay_state(&mut test, settings);
+            (State::Test(test), session)
+        }
+        StartOutcome::RaceLobby { mut test, lobby } => {
+            apply_persistent_gameplay_state(&mut test, settings);
+            (
+                State::RaceLobby {
+                    lobby,
+                    test: Some(test),
+                    started_at: Instant::now(),
+                },
+                None,
+            )
+        }
+    }
+}
+
 fn main() -> io::Result<()> {
+    tunnel::register_cleanup_handlers();
+
     let matches = Opt::command().get_matches();
     let cli_overrides = CliOverrides::from_matches(&matches);
     let opt = Opt::from_arg_matches(&matches).expect("parsed CLI should match Opt");
@@ -791,11 +1124,19 @@ fn main() -> io::Result<()> {
         cursor::SavePosition,
         terminal::EnterAlternateScreen,
     )?;
+    let mut terminal_cleanup = TerminalCleanup::active();
     terminal.clear()?;
 
     let mut state = State::Welcome;
     let mut race_session = None;
     let mut chaos = ChaosState::default();
+
+    if cli_overrides.race {
+        let effective = opt.effective(&settings, &cli_overrides);
+        let (initial_state, session) = state_from_start_outcome(start_test(&effective)?, &settings);
+        state = initial_state;
+        race_session = session;
+    }
 
     state.render_into(&mut terminal, &config, &settings, &languages, &chaos)?;
     loop {
@@ -808,7 +1149,7 @@ fn main() -> io::Result<()> {
         let now = Instant::now();
         chaos.tick(&settings, now);
         let was_test_before_race_events = matches!(state, State::Test(_));
-        apply_race_events(&mut state, &mut race_session);
+        apply_race_events(&mut state, &mut race_session, &mut settings, &settings_path)?;
         if was_test_before_race_events && !matches!(state, State::Test(_)) {
             chaos.reset_test_effects();
         }
@@ -831,9 +1172,16 @@ fn main() -> io::Result<()> {
                 State::Test(test) => {
                     chaos.on_keypress(&settings);
                     chaos.reset_test_effects();
-                    state = State::Results(Results::from(test));
+                    if test.race_progress.is_some() {
+                        race_session = None;
+                    }
+                    state = results_state_from_test(test, &mut settings, &settings_path)?;
                 }
-                State::Settings { .. } => {}
+                State::RaceLobbyStarting { .. }
+                | State::RaceLobby { .. }
+                | State::JoinRace { .. }
+                | State::JoinRaceConnecting { .. }
+                | State::Settings { .. } => {}
             },
             _ => {}
         }
@@ -854,9 +1202,35 @@ fn main() -> io::Result<()> {
                     chaos.on_keypress(&settings);
                     chaos.reset_test_effects();
                     let effective = opt.effective(&settings, &cli_overrides);
-                    let (test, session) = start_test(&effective)?;
+                    let (state, session) =
+                        state_from_start_outcome(start_test(&effective)?, &settings);
                     next_race_session = Some(session);
-                    next_state = Some(State::Test(test));
+                    next_state = Some(state);
+                }
+                Some(Event::Key(KeyEvent {
+                    code: KeyCode::Char('r') | KeyCode::Char('R'),
+                    kind: KeyEventKind::Press,
+                    modifiers: KeyModifiers::NONE | KeyModifiers::SHIFT,
+                    ..
+                })) => {
+                    chaos.on_keypress(&settings);
+                    chaos.reset_test_effects();
+                    let effective = opt.effective(&settings, &cli_overrides);
+                    next_race_session = Some(None);
+                    next_state = Some(start_home_host_race(&effective, &settings));
+                }
+                Some(Event::Key(KeyEvent {
+                    code: KeyCode::Char('j') | KeyCode::Char('J'),
+                    kind: KeyEventKind::Press,
+                    modifiers: KeyModifiers::NONE | KeyModifiers::SHIFT,
+                    ..
+                })) => {
+                    chaos.on_keypress(&settings);
+                    next_race_session = Some(None);
+                    next_state = Some(State::JoinRace {
+                        input: String::new(),
+                        error: None,
+                    });
                 }
                 Some(Event::Key(KeyEvent {
                     code: KeyCode::Char('s') | KeyCode::Char('S'),
@@ -894,20 +1268,212 @@ fn main() -> io::Result<()> {
                     }
                 }
             }
+            State::RaceLobbyStarting {
+                receiver,
+                test,
+                error,
+                ..
+            } => {
+                if let Some(Event::Key(KeyEvent {
+                    code: KeyCode::Esc,
+                    kind: KeyEventKind::Press,
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                })) = event
+                {
+                    next_race_session = Some(None);
+                    next_state = Some(State::Welcome);
+                } else if error.is_none() {
+                    match receiver.try_recv() {
+                        Ok(HostSetupEvent::Ready(lobby)) => {
+                            let Some(test) = test.take() else {
+                                continue;
+                            };
+                            next_state = Some(State::RaceLobby {
+                                lobby,
+                                test: Some(test),
+                                started_at: Instant::now(),
+                            });
+                        }
+                        Ok(HostSetupEvent::Failed(message)) => {
+                            *error = Some(message);
+                        }
+                        Err(TryRecvError::Empty) => {}
+                        Err(TryRecvError::Disconnected) => {
+                            *error = Some("failed to host race: setup stopped unexpectedly".into());
+                        }
+                    }
+                }
+            }
+            State::RaceLobby { lobby, test, .. } => {
+                if let Some(Event::Key(KeyEvent {
+                    code: KeyCode::Esc,
+                    kind: KeyEventKind::Press,
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                })) = event
+                {
+                    lobby.cancel();
+                    next_race_session = Some(None);
+                    next_state = Some(State::Welcome);
+                } else if let Some(lobby_event) = lobby.poll() {
+                    match lobby_event {
+                        LobbyEvent::OpponentConnected(mut session) => {
+                            let Some(mut test) = test.take() else {
+                                continue;
+                            };
+                            if let Some(tunnel) = lobby.take_tunnel() {
+                                session.keep_tunnel(tunnel);
+                            }
+                            test.enable_race();
+                            next_race_session = Some(Some(session));
+                            next_state = Some(State::Test(test));
+                        }
+                        LobbyEvent::Cancelled => {
+                            next_race_session = Some(None);
+                            next_state = Some(State::Welcome);
+                        }
+                        LobbyEvent::Failed(message) => {
+                            eprintln!("{message}");
+                            next_race_session = Some(None);
+                            next_state = Some(State::Welcome);
+                        }
+                    }
+                }
+            }
+            State::JoinRace { input, error } => match event {
+                Some(Event::Key(KeyEvent {
+                    code: KeyCode::Esc,
+                    kind: KeyEventKind::Press,
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                })) => {
+                    next_race_session = Some(None);
+                    next_state = Some(State::Welcome);
+                }
+                Some(Event::Key(KeyEvent {
+                    code: KeyCode::Enter,
+                    kind: KeyEventKind::Press,
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                })) => match race::parse_invite(input.trim()) {
+                    Ok(invite) => {
+                        let input = input.trim().to_string();
+                        next_state = Some(State::JoinRaceConnecting {
+                            receiver: spawn_join_race(invite.clone()),
+                            input,
+                            invite,
+                            started_at: Instant::now(),
+                        });
+                    }
+                    Err(_) => {
+                        *error = Some(JOIN_RACE_ERROR_MESSAGE.into());
+                    }
+                },
+                Some(Event::Key(KeyEvent {
+                    code: KeyCode::Backspace,
+                    kind: KeyEventKind::Press,
+                    ..
+                })) => {
+                    chaos.on_keypress(&settings);
+                    input.pop();
+                    *error = None;
+                }
+                Some(Event::Key(KeyEvent {
+                    code: KeyCode::Char(character),
+                    kind: KeyEventKind::Press,
+                    modifiers,
+                    ..
+                })) if !modifiers.contains(KeyModifiers::CONTROL)
+                    && !modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    chaos.on_keypress(&settings);
+                    input.push(character);
+                    *error = None;
+                }
+                Some(Event::Paste(pasted)) => {
+                    input.push_str(&pasted);
+                    *error = None;
+                }
+                _ => {}
+            },
+            State::JoinRaceConnecting {
+                input, receiver, ..
+            } => {
+                if let Some(Event::Key(KeyEvent {
+                    code: KeyCode::Esc,
+                    kind: KeyEventKind::Press,
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                })) = event
+                {
+                    next_race_session = Some(None);
+                    next_state = Some(State::Welcome);
+                } else {
+                    match receiver.try_recv() {
+                        Ok(JoinRaceEvent::Connected { words, session }) if !words.is_empty() => {
+                            let effective = opt.effective(&settings, &cli_overrides);
+                            let mut test = build_synced_race_test(words, &effective);
+                            apply_persistent_gameplay_state(&mut test, &settings);
+                            test.enable_race();
+                            next_race_session = Some(Some(session));
+                            next_state = Some(State::Test(test));
+                        }
+                        Ok(JoinRaceEvent::Connected { .. }) => {
+                            next_state = Some(State::JoinRace {
+                                input: input.clone(),
+                                error: Some(JOIN_RACE_ERROR_MESSAGE.into()),
+                            });
+                        }
+                        Ok(JoinRaceEvent::Failed(message)) => {
+                            next_state = Some(State::JoinRace {
+                                input: input.clone(),
+                                error: Some(message),
+                            });
+                        }
+                        Err(TryRecvError::Empty) => {}
+                        Err(TryRecvError::Disconnected) => {
+                            next_state = Some(State::JoinRace {
+                                input: input.clone(),
+                                error: Some(JOIN_RACE_ERROR_MESSAGE.into()),
+                            });
+                        }
+                    }
+                }
+            }
             State::Test(ref mut test) => {
                 if let Some(Event::Key(key)) = event {
                     if key.kind == KeyEventKind::Press {
                         chaos.on_keypress(&settings);
                     }
                     let before_progress = test.completed_word_count();
+                    let before_power_combo = test.gameplay.combo;
                     test.handle_key(key);
+                    if test.feature_enabled(GameplayFeature::PowerMode)
+                        && test.completed_word_count() > before_progress
+                        && test.gameplay.combo > before_power_combo
+                    {
+                        chaos.on_power_combo(test.gameplay.combo, now);
+                    }
                     let after_progress = test.completed_word_count();
                     chaos.observe_word_progress(&settings, before_progress, after_progress, now);
                     if report_race_progress(test, &mut race_session, before_progress) {
-                        next_state = Some(State::Results(Results::from(&*test)));
+                        next_race_session = Some(None);
+                        next_state = Some(results_state_from_test(
+                            &*test,
+                            &mut settings,
+                            &settings_path,
+                        )?);
                     } else if test.complete {
                         finalize_local_race(test);
-                        next_state = Some(State::Results(Results::from(&*test)));
+                        if test.race_progress.is_some() {
+                            next_race_session = Some(None);
+                        }
+                        next_state = Some(results_state_from_test(
+                            &*test,
+                            &mut settings,
+                            &settings_path,
+                        )?);
                     }
                 }
             }
@@ -924,9 +1490,10 @@ fn main() -> io::Result<()> {
                     }
                     chaos.reset_test_effects();
                     let effective = opt.effective(&settings, &cli_overrides);
-                    let (test, session) = start_test(&effective)?;
+                    let (state, session) =
+                        state_from_start_outcome(start_test(&effective)?, &settings);
                     next_race_session = Some(session);
-                    next_state = Some(State::Test(test));
+                    next_state = Some(state);
                 }
                 Some(Event::Key(KeyEvent {
                     code: KeyCode::Char('p'),
@@ -950,7 +1517,9 @@ fn main() -> io::Result<()> {
                     let effective = opt.effective(&settings, &cli_overrides);
                     chaos.reset_test_effects();
                     next_race_session = Some(None);
-                    next_state = Some(State::Test(build_test(practice_words, &effective)));
+                    let mut test = build_test(practice_words, &effective);
+                    apply_persistent_gameplay_state(&mut test, &settings);
+                    next_state = Some(State::Test(test));
                 }
                 Some(Event::Key(KeyEvent {
                     code: KeyCode::Char('s') | KeyCode::Char('S'),
@@ -991,39 +1560,51 @@ fn main() -> io::Result<()> {
         }
 
         let now = Instant::now();
+        if let State::Test(test) = &mut state {
+            test.tick(now);
+            if test.complete {
+                finalize_local_race(test);
+                chaos.reset_test_effects();
+                if test.race_progress.is_some() {
+                    race_session = None;
+                }
+                state = results_state_from_test(&*test, &mut settings, &settings_path)?;
+            }
+        }
+
+        let now = Instant::now();
         if let State::Test(test) = &state {
             chaos.update_speed_demon(&settings, test, now);
         }
         let timed_out = match &state {
             State::Test(test) => {
                 let effects = chaos.test_effects(&settings, test, now);
+                let time_multiplier = effects.time_multiplier * test.visual_elapsed_multiplier();
                 if let Some(elapsed) = effects.accelerated_elapsed {
                     test.time_expired_after_elapsed(elapsed)
-                } else if effects.time_multiplier <= 1.0 {
+                } else if time_multiplier <= 1.0 {
                     test.time_expired_at(now)
                 } else {
-                    test.time_expired_at_with_multiplier(now, effects.time_multiplier)
+                    test.time_expired_at_with_multiplier(now, time_multiplier)
                 }
             }
             _ => false,
         };
         if timed_out {
-            if let State::Test(test) = &state {
+            if let State::Test(test) = &mut state {
+                finalize_local_race(test);
                 chaos.reset_test_effects();
-                state = State::Results(Results::from(test));
+                if test.race_progress.is_some() {
+                    race_session = None;
+                }
+                state = results_state_from_test(&*test, &mut settings, &settings_path)?;
             }
         }
 
         state.render_into(&mut terminal, &config, &settings, &languages, &chaos)?;
     }
 
-    terminal::disable_raw_mode()?;
-    execute!(
-        io::stdout(),
-        cursor::RestorePosition,
-        cursor::Show,
-        terminal::LeaveAlternateScreen,
-    )?;
+    terminal_cleanup.finish()?;
 
     Ok(())
 }
@@ -1051,6 +1632,8 @@ mod tests {
             no_backtrack: false,
             sudden_death: false,
             no_backspace: false,
+            gameplay_features: Vec::new(),
+            all_gameplay_features: false,
             command: None,
         }
     }

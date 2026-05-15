@@ -1,4 +1,10 @@
-use crate::{config::Theme, settings::Settings, test::Test, ui::TestRenderEffects};
+use crate::{
+    config::Theme,
+    gameplay::GameplayFeature,
+    settings::Settings,
+    test::Test,
+    ui::{PowerBurst, TestRenderEffects, POWER_BURST_LIFETIME_MS},
+};
 
 use rand::Rng;
 use ratatui::{
@@ -33,6 +39,7 @@ pub struct ChaosState {
     last_blackout_word: usize,
     speed_elapsed: Duration,
     speed_last_tick: Option<Instant>,
+    power_burst: Option<PowerBurst>,
 }
 
 impl Default for ChaosState {
@@ -53,6 +60,7 @@ impl Default for ChaosState {
             last_blackout_word: 0,
             speed_elapsed: Duration::from_secs(0),
             speed_last_tick: None,
+            power_burst: None,
         }
     }
 }
@@ -81,6 +89,12 @@ impl ChaosState {
         if self.blackout_until.is_some_and(|until| now >= until) {
             self.blackout_until = None;
         }
+
+        if self.power_burst.is_some_and(|burst| {
+            now.saturating_duration_since(burst.started_at).as_millis() >= POWER_BURST_LIFETIME_MS
+        }) {
+            self.power_burst = None;
+        }
     }
 
     pub fn on_keypress(&mut self, settings: &Settings) {
@@ -108,6 +122,14 @@ impl ChaosState {
         }
     }
 
+    pub fn on_power_combo(&mut self, combo: usize, now: Instant) {
+        self.power_burst = Some(PowerBurst {
+            seed: rand::thread_rng().gen(),
+            started_at: now,
+            combo,
+        });
+    }
+
     pub fn observe_word_progress(
         &mut self,
         settings: &Settings,
@@ -119,7 +141,7 @@ impl ChaosState {
             return;
         }
 
-        if after_words % 5 == 0 && self.last_blackout_word != after_words {
+        if after_words.is_multiple_of(5) && self.last_blackout_word != after_words {
             self.blackout_until = Some(now + Duration::from_secs(1));
             self.last_blackout_word = after_words;
         }
@@ -132,6 +154,7 @@ impl ChaosState {
         self.last_blackout_word = 0;
         self.speed_elapsed = Duration::from_secs(0);
         self.speed_last_tick = None;
+        self.power_burst = None;
     }
 
     pub fn update_speed_demon(&mut self, settings: &Settings, test: &Test, now: Instant) {
@@ -224,6 +247,11 @@ impl ChaosState {
             time_multiplier: speed_multiplier(settings, test.completed_word_count()),
             accelerated_elapsed: if settings.chaos_speed_demon_mode && test.started_at.is_some() {
                 Some(self.speed_elapsed)
+            } else {
+                None
+            },
+            power_burst: if test.feature_enabled(GameplayFeature::PowerMode) {
+                self.power_burst
             } else {
                 None
             },
@@ -353,7 +381,7 @@ fn random_color(seed: u64, index: u64) -> Color {
 }
 
 fn random_bool(seed: u64, index: u64, salt: u64) -> bool {
-    mix(seed ^ index.wrapping_mul(37) ^ salt.wrapping_mul(997)) % 2 == 0
+    mix(seed ^ index.wrapping_mul(37) ^ salt.wrapping_mul(997)).is_multiple_of(2)
 }
 
 fn mix(mut value: u64) -> u64 {
@@ -495,5 +523,52 @@ mod tests {
 
         let effects = chaos.test_effects(&settings, &test, start + Duration::from_secs(6));
         assert_eq!(effects.accelerated_elapsed, Some(Duration::from_secs(7)));
+    }
+
+    #[test]
+    fn power_burst_is_exposed_only_for_power_mode_tests() {
+        let mut chaos = ChaosState::default();
+        let settings = Settings::default();
+        let now = Instant::now();
+        chaos.on_power_combo(3, now);
+
+        let plain_test = Test::new(vec!["word".into()], true, false, true);
+        assert!(chaos
+            .test_effects(&settings, &plain_test, now)
+            .power_burst
+            .is_none());
+
+        let power_test = Test::new_prepared(
+            vec!["word".into()],
+            true,
+            false,
+            true,
+            None,
+            crate::gameplay::feature_set(&[GameplayFeature::PowerMode]),
+            None,
+        );
+        assert_eq!(
+            chaos.test_effects(&settings, &power_test, now).power_burst,
+            Some(PowerBurst {
+                seed: chaos.power_burst.unwrap().seed,
+                started_at: now,
+                combo: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn power_burst_expires_after_visual_lifetime() {
+        let mut chaos = ChaosState::default();
+        let settings = Settings::default();
+        let now = Instant::now();
+
+        chaos.on_power_combo(5, now);
+        chaos.tick(
+            &settings,
+            now + Duration::from_millis(POWER_BURST_LIFETIME_MS as u64 + 1),
+        );
+
+        assert!(chaos.power_burst.is_none());
     }
 }
