@@ -77,6 +77,8 @@ pub struct Theme {
 
     #[serde(deserialize_with = "deserialize_style")]
     pub results_restart_prompt: Style,
+    #[serde(deserialize_with = "deserialize_style")]
+    pub results_timer: Style,
 }
 
 impl Default for Theme {
@@ -126,6 +128,9 @@ impl Default for Theme {
             results_restart_prompt: Style::default()
                 .fg(Color::Gray)
                 .add_modifier(Modifier::ITALIC),
+            results_timer: Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         }
     }
 }

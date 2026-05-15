@@ -1,6 +1,6 @@
 use crate::config::Theme;
 
-use super::test::{results, Test, TestWord};
+use super::test::{results, RaceOutcome, Test, TestWord};
 
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
@@ -12,6 +12,7 @@ use ratatui::{
     widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph, Widget},
 };
 use results::Fraction;
+use std::time::Instant;
 
 // Convert CPS to WPM (clicks per second)
 const WPM_PER_CPS: f64 = 12.0;
@@ -79,15 +80,43 @@ impl ThemedWidget for &Test {
         buf.set_style(area, theme.default);
 
         // Chunks
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Length(6)])
-            .split(area);
+        let chunks = if self.race_progress.is_some() {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Length(6),
+                    Constraint::Length(4),
+                ])
+                .split(area)
+        } else {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(3), Constraint::Length(6)])
+                .split(area)
+        };
+
+        let mut input_title = vec![Span::styled("Input", theme.title)];
+        if let Some(wpm) = self.live_wpm_at(Instant::now()) {
+            input_title.push(Span::raw(" "));
+            input_title.push(Span::styled(
+                format!("WPM {:.1}", wpm),
+                theme.results_overview,
+            ));
+        }
+        if let Some(remaining) = self.time_remaining_at(Instant::now()) {
+            let remaining_seconds = remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
+            input_title.push(Span::raw(" "));
+            input_title.push(Span::styled(
+                format!("Time {}s", remaining_seconds),
+                theme.results_timer,
+            ));
+        }
 
         // Sections
         let input = SizedBlock {
             block: Block::default()
-                .title(Line::from(vec![Span::styled("Input", theme.title)]))
+                .title(Line::from(input_title))
                 .borders(Borders::ALL)
                 .border_type(theme.border_type)
                 .border_style(theme.input_border),
@@ -130,7 +159,50 @@ impl ThemedWidget for &Test {
                 .border_style(theme.prompt_border),
         );
         target.render(chunks[1], buf);
+
+        if let Some(race) = &self.race_progress {
+            let race_lines = vec![
+                race_progress_line("You", race.you, race.total, theme.results_overview),
+                race_progress_line("Opponent", race.opponent, race.total, theme.prompt_untyped),
+            ];
+            let race = Paragraph::new(race_lines).block(
+                Block::default()
+                    .title(Span::styled("Race", theme.title))
+                    .borders(Borders::ALL)
+                    .border_type(theme.border_type)
+                    .border_style(theme.results_overview_border),
+            );
+            race.render(chunks[2], buf);
+        }
     }
+}
+
+/// Builds one text progress bar line for race mode.
+fn race_progress_line(
+    label: &'static str,
+    completed: usize,
+    total: usize,
+    style: ratatui::style::Style,
+) -> Line<'static> {
+    const BAR_WIDTH: usize = 20;
+
+    let percent = race_percent(completed, total);
+    let filled = BAR_WIDTH * completed.min(total) / total.max(1);
+    let empty = BAR_WIDTH.saturating_sub(filled);
+    Line::from(vec![Span::styled(
+        format!(
+            "{label:<8} [{}{}] {:>3}%",
+            "#".repeat(filled),
+            "-".repeat(empty),
+            percent
+        ),
+        style,
+    )])
+}
+
+/// Calculates a whole-number race progress percentage.
+fn race_percent(completed: usize, total: usize) -> usize {
+    (completed.min(total) * 100).checked_div(total).unwrap_or(0)
 }
 
 fn words_to_spans<'a>(
@@ -287,7 +359,9 @@ impl ThemedWidget for &results::Results {
             .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
             .split(res_chunks[0]);
 
-        let msg = if self.missed_words.is_empty() {
+        let msg = if self.race_progress.is_some() {
+            "Press 'q' to quit"
+        } else if self.missed_words.is_empty() {
             "Press 'q' to quit or 'r' for another test"
         } else {
             "Press 'q' to quit, 'r' for another test or 'p' to practice missed words"
@@ -313,6 +387,16 @@ impl ThemedWidget for &results::Results {
             )),
             Line::from(format!("Correct Keypresses: {}", self.accuracy.overall)),
         ]);
+        if let Some(race) = &self.race_progress {
+            let message = race.message.clone().unwrap_or_else(|| match race.outcome {
+                Some(RaceOutcome::Win) => "Race: You win".into(),
+                Some(RaceOutcome::Lose) => "Race: You lose".into(),
+                Some(RaceOutcome::Tie) => "Race: Tie".into(),
+                Some(RaceOutcome::Disconnected) => "Race: Opponent disconnected".into(),
+                None => "Race: Complete".into(),
+            });
+            overview_text.extend([Line::from(message)]);
+        }
         let overview = Paragraph::new(overview_text).block(
             Block::default()
                 .title(Span::styled("Overview", theme.title))

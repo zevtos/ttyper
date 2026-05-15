@@ -1,4 +1,4 @@
-use super::{is_missed_word_event, Test};
+use super::{is_missed_word_event, RaceProgress, Test};
 
 use crossterm::event::KeyEvent;
 use std::collections::HashMap;
@@ -21,6 +21,10 @@ impl Fraction {
 
 impl From<Fraction> for f64 {
     fn from(f: Fraction) -> Self {
+        if f.denominator == 0 {
+            return 0.0;
+        }
+
         f.numerator as f64 / f.denominator as f64
     }
 }
@@ -59,6 +63,7 @@ pub struct Results {
     pub timing: TimingData,
     pub accuracy: AccuracyData,
     pub missed_words: Vec<String>,
+    pub race_progress: Option<RaceProgress>,
 }
 
 impl From<&Test> for Results {
@@ -70,6 +75,7 @@ impl From<&Test> for Results {
             timing: calc_timing(&events),
             accuracy: calc_accuracy(&events),
             missed_words: calc_missed_words(test),
+            race_progress: test.race_progress.clone(),
         }
     }
 }
@@ -104,7 +110,12 @@ fn calc_timing(events: &[&super::TestEvent]) -> TimingData {
         .map(|(key, (total, count))| (key, total / count as f64))
         .collect();
 
-    timing.overall_cps = timing.per_event.len() as f64 / timing.per_event.iter().sum::<f64>();
+    let overall_seconds = timing.per_event.iter().sum::<f64>();
+    timing.overall_cps = if overall_seconds <= f64::EPSILON {
+        0.0
+    } else {
+        timing.per_event.len() as f64 / overall_seconds
+    };
 
     timing
 }
