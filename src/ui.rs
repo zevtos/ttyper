@@ -12,7 +12,7 @@ use ratatui::{
     widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph, Widget},
 };
 use results::Fraction;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 // Convert CPS to WPM (clicks per second)
 const WPM_PER_CPS: f64 = 12.0;
@@ -75,12 +75,56 @@ impl Theme {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct TestRenderEffects {
+    pub mirror_prompt: bool,
+    pub ghost_mode: bool,
+    pub haunted_mode: bool,
+    pub flicker_seed: u64,
+    pub drunk_prompt_offset: i16,
+    pub blackout_prompt: bool,
+    pub time_multiplier: f64,
+    pub accelerated_elapsed: Option<Duration>,
+}
+
+impl Default for TestRenderEffects {
+    fn default() -> Self {
+        Self {
+            mirror_prompt: false,
+            ghost_mode: false,
+            haunted_mode: false,
+            flicker_seed: 0,
+            drunk_prompt_offset: 0,
+            blackout_prompt: false,
+            time_multiplier: 1.0,
+            accelerated_elapsed: None,
+        }
+    }
+}
+
+pub struct TestView<'a> {
+    pub test: &'a Test,
+    pub effects: TestRenderEffects,
+}
+
 impl ThemedWidget for &Test {
     fn render(self, area: Rect, buf: &mut Buffer, theme: &Theme) {
+        TestView {
+            test: self,
+            effects: TestRenderEffects::default(),
+        }
+        .render(area, buf, theme);
+    }
+}
+
+impl ThemedWidget for TestView<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer, theme: &Theme) {
+        let test = self.test;
+        let effects = self.effects;
         buf.set_style(area, theme.default);
 
         // Chunks
-        let chunks = if self.race_progress.is_some() {
+        let chunks = if test.race_progress.is_some() {
             Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
@@ -97,14 +141,22 @@ impl ThemedWidget for &Test {
         };
 
         let mut input_title = vec![Span::styled("Input", theme.title)];
-        if let Some(wpm) = self.live_wpm_at(Instant::now()) {
+        if let Some(wpm) = test.live_wpm_at(Instant::now()) {
             input_title.push(Span::raw(" "));
             input_title.push(Span::styled(
                 format!("WPM {:.1}", wpm),
                 theme.results_overview,
             ));
         }
-        if let Some(remaining) = self.time_remaining_at(Instant::now()) {
+        let now = Instant::now();
+        let remaining = if let Some(elapsed) = effects.accelerated_elapsed {
+            test.time_remaining_after_elapsed(elapsed)
+        } else if effects.time_multiplier <= 1.0 {
+            test.time_remaining_at(now)
+        } else {
+            test.time_remaining_at_with_multiplier(now, effects.time_multiplier)
+        };
+        if let Some(remaining) = remaining {
             let remaining_seconds = remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
             input_title.push(Span::raw(" "));
             input_title.push(Span::styled(
@@ -123,44 +175,51 @@ impl ThemedWidget for &Test {
             area: chunks[0],
         };
         input.draw_inner(
-            &Line::from(self.words[self.current_word].progress.clone()),
+            &Line::from(test.words[test.current_word].progress.clone()),
             buf,
         );
         input.render(buf);
 
-        let target_lines: Vec<Line> = {
-            let words = words_to_spans(&self.words, self.current_word, theme);
+        let target_block = Block::default()
+            .title(Span::styled("Prompt", theme.title))
+            .borders(Borders::ALL)
+            .border_type(theme.border_type)
+            .border_style(theme.prompt_border);
+        if effects.blackout_prompt {
+            target_block.render(chunks[1], buf);
+        } else {
+            let target_lines: Vec<Line> = {
+                let words = words_to_spans(&test.words, test.current_word, theme, effects);
 
-            let mut lines: Vec<Line> = Vec::new();
-            let mut current_line: Vec<Span> = Vec::new();
-            let mut current_width = 0;
-            for word in words {
-                let word_width: usize = word.iter().map(|s| s.width()).sum();
+                let mut lines: Vec<Line> = Vec::new();
+                let mut current_line: Vec<Span> = Vec::new();
+                let mut current_width = 0;
+                let line_width = (chunks[1].width as usize).saturating_sub(2).max(1);
+                for word in words {
+                    let word_width: usize = word.iter().map(|s| s.width()).sum();
 
-                if current_width + word_width > chunks[1].width as usize - 2 {
-                    current_line.push(Span::raw("\n"));
-                    lines.push(Line::from(current_line.clone()));
-                    current_line.clear();
-                    current_width = 0;
+                    if current_width + word_width > line_width {
+                        current_line.push(Span::raw("\n"));
+                        lines.push(Line::from(current_line.clone()));
+                        current_line.clear();
+                        current_width = 0;
+                    }
+
+                    current_line.extend(word);
+                    current_width += word_width;
                 }
+                lines.push(Line::from(current_line));
 
-                current_line.extend(word);
-                current_width += word_width;
-            }
-            lines.push(Line::from(current_line));
+                apply_drunk_offset(lines, effects.drunk_prompt_offset)
+            };
+            let horizontal_scroll = effects.drunk_prompt_offset.saturating_neg().max(0) as u16;
+            let target = Paragraph::new(target_lines)
+                .scroll((0, horizontal_scroll))
+                .block(target_block);
+            target.render(chunks[1], buf);
+        }
 
-            lines
-        };
-        let target = Paragraph::new(target_lines).block(
-            Block::default()
-                .title(Span::styled("Prompt", theme.title))
-                .borders(Borders::ALL)
-                .border_type(theme.border_type)
-                .border_style(theme.prompt_border),
-        );
-        target.render(chunks[1], buf);
-
-        if let Some(race) = &self.race_progress {
+        if let Some(race) = &test.race_progress {
             let race_lines = vec![
                 race_progress_line("You", race.you, race.total, theme.results_overview),
                 race_progress_line("Opponent", race.opponent, race.total, theme.prompt_untyped),
@@ -205,26 +264,49 @@ fn race_percent(completed: usize, total: usize) -> usize {
     (completed.min(total) * 100).checked_div(total).unwrap_or(0)
 }
 
-fn words_to_spans<'a>(
-    words: &'a [TestWord],
+fn apply_drunk_offset(mut lines: Vec<Line<'static>>, offset: i16) -> Vec<Line<'static>> {
+    if offset <= 0 {
+        return lines;
+    }
+
+    let padding = Span::raw(" ".repeat(offset as usize));
+    for line in &mut lines {
+        line.spans.insert(0, padding.clone());
+    }
+    lines
+}
+
+fn words_to_spans(
+    words: &[TestWord],
     current_word: usize,
-    theme: &'a Theme,
-) -> Vec<Vec<Span<'a>>> {
+    theme: &Theme,
+    effects: TestRenderEffects,
+) -> Vec<Vec<Span<'static>>> {
     let mut spans = Vec::new();
+    let mut visual_index = 0usize;
 
-    for word in &words[..current_word] {
-        let parts = split_typed_word(word);
-        spans.push(word_parts_to_spans(parts, theme));
+    for (word_index, word) in words.iter().enumerate() {
+        let parts = if word_index < current_word {
+            split_typed_word(word)
+        } else if word_index == current_word {
+            split_current_word(word)
+        } else {
+            vec![(word.text.clone(), Status::Untyped)]
+        };
+        spans.push(word_parts_to_spans(
+            parts,
+            theme,
+            effects,
+            word_index >= current_word,
+            &mut visual_index,
+        ));
     }
 
-    let parts_current = split_current_word(&words[current_word]);
-    spans.push(word_parts_to_spans(parts_current, theme));
-
-    for word in &words[current_word + 1..] {
-        let parts = vec![(word.text.clone(), Status::Untyped)];
-        spans.push(word_parts_to_spans(parts, theme));
+    if effects.mirror_prompt {
+        mirror_words(spans)
+    } else {
+        spans
     }
-    spans
 }
 
 #[derive(PartialEq, Clone, Copy, Debug)]
@@ -320,7 +402,13 @@ fn split_typed_word(word: &TestWord) -> Vec<(String, Status)> {
     parts
 }
 
-fn word_parts_to_spans(parts: Vec<(String, Status)>, theme: &Theme) -> Vec<Span<'_>> {
+fn word_parts_to_spans(
+    parts: Vec<(String, Status)>,
+    theme: &Theme,
+    effects: TestRenderEffects,
+    apply_chaos: bool,
+    visual_index: &mut usize,
+) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     for (text, status) in parts {
         let style = match status {
@@ -334,10 +422,83 @@ fn word_parts_to_spans(parts: Vec<(String, Status)>, theme: &Theme) -> Vec<Span<
             Status::Overtyped => theme.prompt_incorrect,
         };
 
+        let text = if apply_chaos && is_untyped_status(status) {
+            decorate_untyped_text(&text, effects, visual_index)
+        } else {
+            *visual_index += text.chars().count();
+            text
+        };
+
         spans.push(Span::styled(text, style));
     }
     spans.push(Span::styled(" ", theme.prompt_untyped));
     spans
+}
+
+fn is_untyped_status(status: Status) -> bool {
+    matches!(
+        status,
+        Status::CurrentUntyped | Status::Cursor | Status::Untyped
+    )
+}
+
+fn decorate_untyped_text(
+    text: &str,
+    effects: TestRenderEffects,
+    visual_index: &mut usize,
+) -> String {
+    const HAUNTED_CHARS: [char; 4] = ['░', '▒', '▓', '█'];
+
+    let mut decorated = String::new();
+    let ghost_rate = 20 + effects.flicker_seed % 11;
+
+    for character in text.chars() {
+        let index = *visual_index;
+        if effects.haunted_mode && chance(effects.flicker_seed, index, 17, 12) {
+            let ghost_index =
+                (mix(effects.flicker_seed ^ index as u64 ^ 0xCAFE) as usize) % HAUNTED_CHARS.len();
+            decorated.push(HAUNTED_CHARS[ghost_index]);
+        }
+
+        if effects.ghost_mode && chance(effects.flicker_seed, index, 29, ghost_rate) {
+            decorated.push(' ');
+        } else {
+            decorated.push(character);
+        }
+
+        *visual_index += 1;
+    }
+
+    decorated
+}
+
+fn mirror_words(words: Vec<Vec<Span<'static>>>) -> Vec<Vec<Span<'static>>> {
+    words
+        .into_iter()
+        .rev()
+        .map(|word| {
+            word.into_iter()
+                .rev()
+                .map(|span| {
+                    Span::styled(
+                        span.content.as_ref().chars().rev().collect::<String>(),
+                        span.style,
+                    )
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn chance(seed: u64, index: usize, salt: u64, percent: u64) -> bool {
+    mix(seed ^ (index as u64).wrapping_mul(0x9E37) ^ salt.wrapping_mul(0x51)) % 100 < percent
+}
+
+fn mix(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
 }
 
 impl ThemedWidget for &results::Results {

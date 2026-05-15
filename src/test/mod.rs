@@ -230,21 +230,49 @@ impl Test {
 
     /// Returns the remaining countdown time for timed tests.
     pub fn time_remaining_at(&self, now: Instant) -> Option<Duration> {
+        self.time_remaining_at_with_multiplier(now, 1.0)
+    }
+
+    /// Returns countdown time with a visual/effective timer multiplier.
+    pub fn time_remaining_at_with_multiplier(
+        &self,
+        now: Instant,
+        multiplier: f64,
+    ) -> Option<Duration> {
         let time_limit = self.time_limit?;
         let Some(started_at) = self.started_at else {
             return Some(time_limit);
         };
 
         let elapsed = now.checked_duration_since(started_at).unwrap_or_default();
+        let elapsed = scale_duration(elapsed, multiplier);
 
         Some(time_limit.saturating_sub(elapsed))
     }
 
+    /// Returns countdown time after an externally tracked effective elapsed duration.
+    pub fn time_remaining_after_elapsed(&self, elapsed: Duration) -> Option<Duration> {
+        Some(self.time_limit?.saturating_sub(elapsed))
+    }
+
     /// Returns true after a timed test has started and consumed its duration.
     pub fn time_expired_at(&self, now: Instant) -> bool {
+        self.time_expired_at_with_multiplier(now, 1.0)
+    }
+
+    /// Returns true after a scaled timed test has consumed its duration.
+    pub fn time_expired_at_with_multiplier(&self, now: Instant, multiplier: f64) -> bool {
         self.started_at.is_some()
             && self
-                .time_remaining_at(now)
+                .time_remaining_at_with_multiplier(now, multiplier)
+                .is_some_and(|remaining| remaining.is_zero())
+    }
+
+    /// Returns true when an externally tracked effective duration has consumed timed mode.
+    pub fn time_expired_after_elapsed(&self, elapsed: Duration) -> bool {
+        self.started_at.is_some()
+            && self
+                .time_remaining_after_elapsed(elapsed)
                 .is_some_and(|remaining| remaining.is_zero())
     }
 
@@ -331,6 +359,14 @@ fn is_typing_key(key: &KeyEvent) -> bool {
     )
 }
 
+fn scale_duration(duration: Duration, multiplier: f64) -> Duration {
+    if multiplier <= 1.0 {
+        return duration;
+    }
+
+    Duration::from_secs_f64(duration.as_secs_f64() * multiplier)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,6 +425,44 @@ mod tests {
             Some(Duration::from_secs(20))
         );
         assert!(test.time_expired_at(start + Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn timed_test_uses_multiplier_for_speed_demon_countdown() {
+        let start = Instant::now();
+        let mut test = Test::new_with_time_limit(
+            vec!["hello".into()],
+            true,
+            false,
+            true,
+            Some(Duration::from_secs(30)),
+        );
+        test.started_at = Some(start);
+
+        assert_eq!(
+            test.time_remaining_at_with_multiplier(start + Duration::from_secs(5), 2.0),
+            Some(Duration::from_secs(20))
+        );
+        assert!(test.time_expired_at_with_multiplier(start + Duration::from_secs(15), 2.0));
+    }
+
+    #[test]
+    fn timed_test_can_use_externally_tracked_elapsed_time() {
+        let start = Instant::now();
+        let mut test = Test::new_with_time_limit(
+            vec!["hello".into()],
+            true,
+            false,
+            true,
+            Some(Duration::from_secs(30)),
+        );
+        test.started_at = Some(start);
+
+        assert_eq!(
+            test.time_remaining_after_elapsed(Duration::from_secs(12)),
+            Some(Duration::from_secs(18))
+        );
+        assert!(test.time_expired_after_elapsed(Duration::from_secs(30)));
     }
 
     #[test]

@@ -7,7 +7,7 @@ use serde::{
     Deserialize,
 };
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub default_language: String,
@@ -23,7 +23,7 @@ impl Default for Config {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 pub struct Theme {
     #[serde(deserialize_with = "deserialize_style")]
@@ -133,6 +133,169 @@ impl Default for Theme {
                 .add_modifier(Modifier::BOLD),
         }
     }
+}
+
+pub const THEME_NAMES: [&str; 7] = [
+    "Default",
+    "Catppuccin",
+    "Dracula",
+    "Nord",
+    "Gruvbox",
+    "Solarized",
+    "Tokyo Night",
+];
+
+pub fn theme_by_name(name: &str) -> Theme {
+    match name {
+        "Catppuccin" => preset_theme(PresetTheme {
+            input_border: "89b4fa",
+            prompt_border: "a6e3a1",
+            prompt_correct: "a6e3a1",
+            prompt_incorrect: "f38ba8",
+            prompt_untyped: "6c7086",
+            prompt_current_correct: "a6e3a1;bold",
+            prompt_current_incorrect: "f38ba8;bold",
+            prompt_current_untyped: "89b4fa;bold",
+            results_overview: "cba6f7;bold",
+            results_overview_border: "cba6f7",
+            results_worst_keys: "cba6f7;bold",
+            results_worst_keys_border: "cba6f7",
+            results_chart: "89b4fa",
+            title: "cba6f7;bold",
+        }),
+        "Dracula" => preset_theme(PresetTheme {
+            input_border: "bd93f9",
+            prompt_border: "50fa7b",
+            prompt_correct: "50fa7b",
+            prompt_incorrect: "ff5555",
+            prompt_untyped: "6272a4",
+            prompt_current_correct: "50fa7b;bold",
+            prompt_current_incorrect: "ff5555;bold",
+            prompt_current_untyped: "bd93f9;bold",
+            results_overview: "ff79c6;bold",
+            results_overview_border: "ff79c6",
+            results_worst_keys: "ff79c6;bold",
+            results_worst_keys_border: "ff79c6",
+            results_chart: "bd93f9",
+            title: "ff79c6;bold",
+        }),
+        "Nord" => preset_theme(PresetTheme {
+            input_border: "81a1c1",
+            prompt_border: "a3be8c",
+            prompt_correct: "a3be8c",
+            prompt_incorrect: "bf616a",
+            prompt_untyped: "4c566a",
+            prompt_current_correct: "a3be8c;bold",
+            prompt_current_incorrect: "bf616a;bold",
+            prompt_current_untyped: "81a1c1;bold",
+            results_overview: "88c0d0;bold",
+            results_overview_border: "88c0d0",
+            results_worst_keys: "88c0d0;bold",
+            results_worst_keys_border: "88c0d0",
+            results_chart: "81a1c1",
+            title: "88c0d0;bold",
+        }),
+        "Gruvbox" => preset_theme(PresetTheme {
+            input_border: "83a598",
+            prompt_border: "b8bb26",
+            prompt_correct: "b8bb26",
+            prompt_incorrect: "fb4934",
+            prompt_untyped: "665c54",
+            prompt_current_correct: "b8bb26;bold",
+            prompt_current_incorrect: "fb4934;bold",
+            prompt_current_untyped: "83a598;bold",
+            results_overview: "fabd2f;bold",
+            results_overview_border: "fabd2f",
+            results_worst_keys: "fabd2f;bold",
+            results_worst_keys_border: "fabd2f",
+            results_chart: "83a598",
+            title: "fabd2f;bold",
+        }),
+        "Solarized" => preset_theme(PresetTheme {
+            input_border: "268bd2",
+            prompt_border: "859900",
+            prompt_correct: "859900",
+            prompt_incorrect: "dc322f",
+            prompt_untyped: "586e75",
+            prompt_current_correct: "859900;bold",
+            prompt_current_incorrect: "dc322f;bold",
+            prompt_current_untyped: "268bd2;bold",
+            results_overview: "2aa198;bold",
+            results_overview_border: "2aa198",
+            results_worst_keys: "2aa198;bold",
+            results_worst_keys_border: "2aa198",
+            results_chart: "268bd2",
+            title: "2aa198;bold",
+        }),
+        "Tokyo Night" => preset_theme(PresetTheme {
+            input_border: "7aa2f7",
+            prompt_border: "9ece6a",
+            prompt_correct: "9ece6a",
+            prompt_incorrect: "f7768e",
+            prompt_untyped: "565f89",
+            prompt_current_correct: "9ece6a;bold",
+            prompt_current_incorrect: "f7768e;bold",
+            prompt_current_untyped: "7aa2f7;bold",
+            results_overview: "bb9af7;bold",
+            results_overview_border: "bb9af7",
+            results_worst_keys: "bb9af7;bold",
+            results_worst_keys_border: "bb9af7",
+            results_chart: "7aa2f7",
+            title: "bb9af7;bold",
+        }),
+        _ => Theme::default(),
+    }
+}
+
+struct PresetTheme {
+    input_border: &'static str,
+    prompt_border: &'static str,
+    prompt_correct: &'static str,
+    prompt_incorrect: &'static str,
+    prompt_untyped: &'static str,
+    prompt_current_correct: &'static str,
+    prompt_current_incorrect: &'static str,
+    prompt_current_untyped: &'static str,
+    results_overview: &'static str,
+    results_overview_border: &'static str,
+    results_worst_keys: &'static str,
+    results_worst_keys_border: &'static str,
+    results_chart: &'static str,
+    title: &'static str,
+}
+
+fn preset_theme(preset: PresetTheme) -> Theme {
+    let defaults = Theme::default();
+    Theme {
+        default: defaults.default,
+        title: style_from_str(preset.title),
+        input_border: style_from_str(preset.input_border),
+        prompt_border: style_from_str(preset.prompt_border),
+        border_type: defaults.border_type,
+        prompt_correct: style_from_str(preset.prompt_correct),
+        prompt_incorrect: style_from_str(preset.prompt_incorrect),
+        prompt_untyped: style_from_str(preset.prompt_untyped),
+        prompt_current_correct: style_from_str(preset.prompt_current_correct),
+        prompt_current_incorrect: style_from_str(preset.prompt_current_incorrect),
+        prompt_current_untyped: style_from_str(preset.prompt_current_untyped),
+        prompt_cursor: defaults.prompt_cursor,
+        results_overview: style_from_str(preset.results_overview),
+        results_overview_border: style_from_str(preset.results_overview_border),
+        results_worst_keys: style_from_str(preset.results_worst_keys),
+        results_worst_keys_border: style_from_str(preset.results_worst_keys_border),
+        results_chart: style_from_str(preset.results_chart),
+        results_chart_x: style_from_str(preset.results_chart),
+        results_chart_y: defaults.results_chart_y,
+        results_restart_prompt: defaults.results_restart_prompt,
+        results_timer: defaults.results_timer,
+    }
+}
+
+fn style_from_str(value: &str) -> Style {
+    deserialize_style(de::IntoDeserializer::<de::value::Error>::into_deserializer(
+        value,
+    ))
+    .expect("preset theme style should be valid")
 }
 
 fn deserialize_style<'de, D>(deserializer: D) -> Result<Style, D::Error>
