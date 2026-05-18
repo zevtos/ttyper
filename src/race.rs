@@ -294,25 +294,32 @@ fn spawn_host_accept_loop(
         }
 
         match listener.accept() {
-            Ok((mut stream, _)) => match handle_lobby_client(&mut stream, &room_code, &words) {
-                Ok(true) => match RaceSession::new(stream) {
-                    Ok(session) => {
-                        let _ = sender.send(LobbyEvent::OpponentConnected(session));
-                        return;
-                    }
+            Ok((mut stream, _)) => {
+                // On Windows the accepted socket inherits the listener's non-blocking
+                // flag, so read_line() in the handshake would immediately return
+                // WouldBlock (os error 10035). Reset to blocking here; the handshake
+                // runs in this background thread so blocking is safe.
+                let _ = stream.set_nonblocking(false);
+                match handle_lobby_client(&mut stream, &room_code, &words) {
+                    Ok(true) => match RaceSession::new(stream) {
+                        Ok(session) => {
+                            let _ = sender.send(LobbyEvent::OpponentConnected(session));
+                            return;
+                        }
+                        Err(error) => {
+                            let _ = sender.send(LobbyEvent::Failed(format!(
+                                "could not start race session: {error}"
+                            )));
+                            return;
+                        }
+                    },
+                    Ok(false) => {}
                     Err(error) => {
-                        let _ = sender.send(LobbyEvent::Failed(format!(
-                            "could not start race session: {error}"
-                        )));
+                        let _ = sender.send(LobbyEvent::Failed(format!("race lobby failed: {error}")));
                         return;
                     }
-                },
-                Ok(false) => {}
-                Err(error) => {
-                    let _ = sender.send(LobbyEvent::Failed(format!("race lobby failed: {error}")));
-                    return;
                 }
-            },
+            }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(100));
             }
