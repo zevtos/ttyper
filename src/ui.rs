@@ -156,6 +156,7 @@ pub struct RaceLobbyView<'a> {
     pub status: &'a str,
     pub spinner: &'a str,
     pub cancel_label: &'a str,
+    pub copy_hint: &'a str,
     pub error: Option<&'a str>,
 }
 
@@ -163,7 +164,7 @@ impl ThemedWidget for RaceLobbyView<'_> {
     fn render(self, area: Rect, buf: &mut Buffer, theme: &Theme) {
         buf.set_style(area, theme.default);
 
-        let lobby_area = centered_rect(area, 49, 12);
+        let lobby_area = centered_rect(area, 52, 14);
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(theme.border_type)
@@ -184,23 +185,31 @@ impl ThemedWidget for RaceLobbyView<'_> {
             theme.results_overview
         };
 
+        // copy_hint: flash green when "✓ Copied!", otherwise dimmed
+        let copy_style = if self.copy_hint.starts_with('\u{2713}') {
+            theme.prompt_current_correct
+        } else {
+            theme.results_restart_prompt
+        };
+
         let lines = Text::from(vec![
-            Line::from(Span::styled("RACE LOBBY - HOSTING", theme.title)),
+            Line::from(Span::styled("RACE LOBBY - LOCAL HOST", theme.title)),
             Line::from(""),
             Line::from(vec![
                 Span::styled("Room code : ", theme.results_overview),
                 Span::styled(self.room_code.to_string(), theme.results_timer),
             ]),
             Line::from(vec![
-                Span::styled("Public    : ", theme.results_overview),
+                Span::styled("Address   : ", theme.results_overview),
                 Span::raw(self.public_addr.to_string()),
             ]),
-            Line::from("Send this to your friend:"),
+            Line::from("Share this command with your friend:"),
             Line::from(""),
             Line::from(Span::styled(
                 self.invite_command.to_string(),
                 theme.prompt_current_untyped,
             )),
+            Line::from(Span::styled(self.copy_hint.to_string(), copy_style)),
             Line::from(""),
             Line::from(Span::styled(status, status_style)),
             Line::from(Span::styled(

@@ -474,6 +474,7 @@ enum State {
         lobby: race::HostLobby,
         test: Option<Test>,
         started_at: Instant,
+        copied_at: Option<Instant>,
     },
     JoinRace {
         input: String,
@@ -540,11 +541,12 @@ impl State {
                     f.render_widget(
                         theme.apply_to(ui::RaceLobbyView {
                             room_code: "----",
-                            public_addr: "Preparing tunnel...",
-                            invite_command: "Preparing invite command...",
-                            status: "Setting up race lobby...",
+                            public_addr: "Binding local port...",
+                            invite_command: "Generating invite command...",
+                            status: "Setting up local race lobby...",
                             spinner: spinner_at(*started_at),
                             cancel_label: "Press Esc to cancel and go back",
+                            copy_hint: "",
                             error: error.as_deref(),
                         }),
                         area,
@@ -552,8 +554,12 @@ impl State {
                 })?;
             }
             State::RaceLobby {
-                lobby, started_at, ..
+                lobby, started_at, copied_at, ..
             } => {
+                let copy_label = copied_at
+                    .filter(|t| t.elapsed().as_secs() < 3)
+                    .map(|_| "✓ Copied!")
+                    .unwrap_or("Press C to copy");
                 terminal.draw(|f| {
                     let area = chaos.earthquake_area(f.size(), settings);
                     f.render_widget(
@@ -564,6 +570,7 @@ impl State {
                             status: "Waiting for opponent to connect...",
                             spinner: spinner_at(*started_at),
                             cancel_label: "Press Esc to cancel and go back",
+                            copy_hint: copy_label,
                             error: None,
                         }),
                         area,
@@ -835,12 +842,12 @@ fn start_host_lobby_setup(test: Test) -> State {
     }
 }
 
-fn spawn_host_lobby_setup(bind_addr: String, words: Vec<String>) -> Receiver<HostSetupEvent> {
+fn spawn_host_lobby_setup(_bind_addr: String, words: Vec<String>) -> Receiver<HostSetupEvent> {
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
-        let event = match race::HostLobby::start(&bind_addr, words) {
+        let event = match race::HostLobby::start_local(words) {
             Ok(lobby) => HostSetupEvent::Ready(lobby),
-            Err(error) => HostSetupEvent::Failed(format!("failed to host race: {error}")),
+            Err(error) => HostSetupEvent::Failed(format!("failed to host local race: {error}")),
         };
         let _ = sender.send(event);
     });
@@ -1071,6 +1078,7 @@ fn state_from_start_outcome(
                     lobby,
                     test: Some(test),
                     started_at: Instant::now(),
+                    copied_at: None,
                 },
                 None,
             )
@@ -1293,6 +1301,7 @@ fn main() -> io::Result<()> {
                                 lobby,
                                 test: Some(test),
                                 started_at: Instant::now(),
+                                copied_at: None,
                             });
                         }
                         Ok(HostSetupEvent::Failed(message)) => {
@@ -1305,7 +1314,12 @@ fn main() -> io::Result<()> {
                     }
                 }
             }
-            State::RaceLobby { lobby, test, .. } => {
+            State::RaceLobby {
+                lobby,
+                test,
+                copied_at,
+                ..
+            } => {
                 if let Some(Event::Key(KeyEvent {
                     code: KeyCode::Esc,
                     kind: KeyEventKind::Press,
@@ -1316,6 +1330,18 @@ fn main() -> io::Result<()> {
                     lobby.cancel();
                     next_race_session = Some(None);
                     next_state = Some(State::Welcome);
+                } else if let Some(Event::Key(KeyEvent {
+                    code: KeyCode::Char('c') | KeyCode::Char('C'),
+                    kind: KeyEventKind::Press,
+                    modifiers: KeyModifiers::NONE | KeyModifiers::SHIFT,
+                    ..
+                })) = event
+                {
+                    let cmd = lobby.invite_command().to_string();
+                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                        let _ = clipboard.set_text(cmd);
+                    }
+                    *copied_at = Some(Instant::now());
                 } else if let Some(lobby_event) = lobby.poll() {
                     match lobby_event {
                         LobbyEvent::OpponentConnected(mut session) => {

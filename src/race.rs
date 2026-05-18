@@ -51,7 +51,7 @@ pub struct HostLobby {
 }
 
 impl HostLobby {
-    /// Creates a hosted lobby, starts bore, and begins waiting for the first valid opponent.
+    /// Creates a hosted lobby using a public bore tunnel.
     pub fn start(bind_addr: &str, words: Vec<String>) -> io::Result<Self> {
         let listener = TcpListener::bind(bind_addr)?;
         listener.set_nonblocking(true)?;
@@ -79,6 +79,39 @@ impl HostLobby {
             receiver,
             cancel,
             tunnel: Some(tunnel),
+        })
+    }
+
+    /// Creates a local-only hosted lobby (no bore tunnel required).
+    /// The invite command uses the machine's LAN IP so friends on the same
+    /// network can join with `ttyper --race <LAN_IP>:7878#CODE`.
+    pub fn start_local(words: Vec<String>) -> io::Result<Self> {
+        let bind_addr = format!("0.0.0.0:{LOCAL_RACE_PORT}");
+        let listener = TcpListener::bind(&bind_addr)?;
+        listener.set_nonblocking(true)?;
+
+        let room_code = generate_room_code();
+        let local_ip = detect_local_ip().unwrap_or_else(|| "127.0.0.1".to_string());
+        let public_addr = format!("{local_ip}:{LOCAL_RACE_PORT}");
+        let invite_command = format!("ttyper --race {public_addr}#{room_code}");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = mpsc::channel();
+
+        spawn_host_accept_loop(
+            listener,
+            room_code.clone(),
+            words,
+            Arc::clone(&cancel),
+            sender,
+        );
+
+        Ok(Self {
+            room_code,
+            public_addr,
+            invite_command,
+            receiver,
+            cancel,
+            tunnel: None,
         })
     }
 
@@ -512,6 +545,18 @@ fn generate_room_code() -> String {
 
 fn is_valid_room_code(code: &str) -> bool {
     code.len() == 4 && code.chars().all(|character| character.is_ascii_digit())
+}
+
+/// Detects the machine's primary LAN IP address by connecting a UDP socket
+/// to an external address (no packets are actually sent).
+fn detect_local_ip() -> Option<String> {
+    use std::net::UdpSocket;
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    socket
+        .local_addr()
+        .ok()
+        .map(|addr| addr.ip().to_string())
 }
 
 #[cfg(test)]
