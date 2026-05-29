@@ -156,6 +156,7 @@ pub struct RaceLobbyView<'a> {
     pub status: &'a str,
     pub spinner: &'a str,
     pub cancel_label: &'a str,
+    pub start_label: &'a str,
     pub copy_hint: &'a str,
     pub error: Option<&'a str>,
 }
@@ -164,7 +165,7 @@ impl ThemedWidget for RaceLobbyView<'_> {
     fn render(self, area: Rect, buf: &mut Buffer, theme: &Theme) {
         buf.set_style(area, theme.default);
 
-        let lobby_area = centered_rect(area, 52, 14);
+        let lobby_area = centered_rect(area, 52, 16);
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(theme.border_type)
@@ -192,7 +193,7 @@ impl ThemedWidget for RaceLobbyView<'_> {
             theme.results_restart_prompt
         };
 
-        let lines = Text::from(vec![
+        let mut lines = vec![
             Line::from(Span::styled("RACE LOBBY - LOCAL HOST", theme.title)),
             Line::from(""),
             Line::from(vec![
@@ -212,8 +213,57 @@ impl ThemedWidget for RaceLobbyView<'_> {
             Line::from(Span::styled(self.copy_hint.to_string(), copy_style)),
             Line::from(""),
             Line::from(Span::styled(status, status_style)),
+        ];
+
+        if !self.start_label.is_empty() {
+            lines.push(Line::from(Span::styled(
+                self.start_label.to_string(),
+                theme.prompt_current_correct,
+            )));
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            self.cancel_label.to_string(),
+            theme.results_restart_prompt,
+        )));
+
+        Paragraph::new(Text::from(lines)).render(inner, buf);
+    }
+}
+
+pub struct JoinRaceLobbyView<'a> {
+    pub status: &'a str,
+    pub spinner: &'a str,
+}
+
+impl ThemedWidget for JoinRaceLobbyView<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer, theme: &Theme) {
+        buf.set_style(area, theme.default);
+
+        let lobby_area = centered_rect(area, 52, 10);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(theme.border_type)
+            .border_style(theme.input_border);
+        let inner = block.inner(lobby_area);
+        block.render(lobby_area, buf);
+
+        let status = if self.spinner.is_empty() {
+            self.status.to_string()
+        } else {
+            format!("{} {}", self.status, self.spinner)
+        };
+
+        let lines = Text::from(vec![
+            Line::from(Span::styled("RACE LOBBY - JOINED", theme.title)),
+            Line::from(""),
+            Line::from(Span::styled(status, theme.results_overview)),
+            Line::from(""),
+            Line::from("Wait for the host to start the race..."),
+            Line::from(""),
             Line::from(Span::styled(
-                self.cancel_label.to_string(),
+                "Press Esc to leave",
                 theme.results_restart_prompt,
             )),
         ]);
@@ -231,7 +281,7 @@ impl ThemedWidget for JoinRaceView<'_> {
     fn render(self, area: Rect, buf: &mut Buffer, theme: &Theme) {
         buf.set_style(area, theme.default);
 
-        let join_area = centered_rect(area, 49, 13);
+        let join_area = centered_rect(area, 52, 15);
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(theme.border_type)
@@ -242,8 +292,15 @@ impl ThemedWidget for JoinRaceView<'_> {
         let mut lines = vec![
             Line::from(Span::styled("JOIN A RACE", theme.title)),
             Line::from(""),
-            Line::from("Paste the connection string"),
-            Line::from("your friend sent you:"),
+            Line::from("Enter the connection string from the host:"),
+            Line::from(Span::styled(
+                "  IP:PORT#CODE  or just  IP#CODE",
+                theme.results_overview,
+            )),
+            Line::from(Span::styled(
+                "  e.g. 192.168.1.5:7878#1234",
+                theme.prompt_untyped,
+            )),
             Line::from(""),
             Line::from(Span::styled(
                 format!("> {}_", self.input),

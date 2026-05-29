@@ -135,8 +135,9 @@ impl Default for Theme {
     }
 }
 
-pub const THEME_NAMES: [&str; 7] = [
+pub const THEME_NAMES: [&str; 8] = [
     "Default",
+    "Plain",
     "Catppuccin",
     "Dracula",
     "Nord",
@@ -147,6 +148,34 @@ pub const THEME_NAMES: [&str; 7] = [
 
 pub fn theme_by_name(name: &str) -> Theme {
     match name {
+        "Plain" => {
+            let defaults = Theme::default();
+            Theme {
+                default: Style::default(),
+                title: Style::default().add_modifier(Modifier::BOLD),
+                input_border: Style::default(),
+                prompt_border: Style::default(),
+                border_type: defaults.border_type,
+                prompt_correct: Style::default(),
+                prompt_incorrect: Style::default().add_modifier(Modifier::UNDERLINED),
+                prompt_untyped: Style::default().add_modifier(Modifier::DIM),
+                prompt_current_correct: Style::default().add_modifier(Modifier::BOLD),
+                prompt_current_incorrect: Style::default()
+                    .add_modifier(Modifier::UNDERLINED)
+                    .add_modifier(Modifier::BOLD),
+                prompt_current_untyped: Style::default().add_modifier(Modifier::BOLD),
+                prompt_cursor: defaults.prompt_cursor,
+                results_overview: Style::default().add_modifier(Modifier::BOLD),
+                results_overview_border: Style::default(),
+                results_worst_keys: Style::default().add_modifier(Modifier::BOLD),
+                results_worst_keys_border: Style::default(),
+                results_chart: Style::default(),
+                results_chart_x: Style::default(),
+                results_chart_y: Style::default().add_modifier(Modifier::BOLD),
+                results_restart_prompt: Style::default().add_modifier(Modifier::ITALIC),
+                results_timer: Style::default().add_modifier(Modifier::BOLD),
+            }
+        }
         "Catppuccin" => preset_theme(PresetTheme {
             input_border: "89b4fa",
             prompt_border: "a6e3a1",

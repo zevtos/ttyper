@@ -24,6 +24,8 @@ pub enum RaceEvent {
     OpponentProgress(usize),
     OpponentFinished { wpm: f64, accuracy: f64 },
     Disconnected(String),
+    SyncWords(Vec<String>),
+    Start,
 }
 
 /// Result produced by the host lobby background accept loop.
@@ -185,6 +187,18 @@ impl RaceSession {
         self.tunnel = Some(tunnel);
     }
 
+    /// Sends a new word list to the opponent.
+    pub fn send_words(&mut self, words: &[String]) -> io::Result<()> {
+        let encoded = serde_json::to_string(words)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        write_protocol_line(&self.writer, &format!("WORDS {encoded}"))
+    }
+
+    /// Sends the start signal to the opponent.
+    pub fn send_start(&mut self) -> io::Result<()> {
+        write_protocol_line(&self.writer, "START")
+    }
+
     /// Sends the local completed-word index to the opponent.
     pub fn send_progress(&mut self, word_index: usize) -> io::Result<()> {
         write_protocol_line(&self.writer, &format!("PROGRESS {word_index}"))
@@ -211,7 +225,7 @@ impl Drop for RaceSession {
     }
 }
 
-/// Connects to a race host and receives the authoritative word list.
+/// Connects to a race host and enters the lobby.
 pub fn client(invite: &RaceInvite) -> io::Result<(Vec<String>, RaceSession)> {
     let mut stream = TcpStream::connect(&invite.addr)?;
     stream.set_nodelay(true)?;
@@ -247,21 +261,78 @@ pub fn client(invite: &RaceInvite) -> io::Result<(Vec<String>, RaceSession)> {
 
     let words = read_word_list(&mut reader)?;
     read_start(&mut reader)?;
-    drop(reader);
 
     Ok((words, RaceSession::new(stream)?))
 }
 
-/// Parses a race address in HOST:PORT#CODE format.
+fn read_word_list<R: BufRead>(reader: &mut R) -> io::Result<Vec<String>> {
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "race host closed before sending words",
+            ));
+        }
+        trim_protocol_line(&mut line);
+        if line == "PING" {
+            continue;
+        }
+        if let Some(encoded) = line.strip_prefix("WORDS ") {
+            return serde_json::from_str(encoded)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error));
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid race word list",
+        ));
+    }
+}
+
+fn read_start<R: BufRead>(reader: &mut R) -> io::Result<()> {
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "race host closed before sending start signal",
+            ));
+        }
+        trim_protocol_line(&mut line);
+        if line == "PING" {
+            continue;
+        }
+        if line == "START" {
+            return Ok(());
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid race start signal",
+        ));
+    }
+}
+
+/// Parses a race invite from several accepted formats:
+///   - Full CLI command: `ttyper --race 192.168.1.5:7878#1234`
+///   - Address + code:   `192.168.1.5:7878#1234`
+///   - IP + code:        `192.168.1.5#1234`  (port defaults to 7878)
 pub fn parse_invite(input: &str) -> io::Result<RaceInvite> {
+    // Strip the CLI prefix if the user pasted the full copied command.
+    let input = input
+        .trim()
+        .strip_prefix("ttyper --race ")
+        .unwrap_or(input)
+        .trim();
+
     let (addr, room_code) = input.split_once('#').ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "race address must look like host:port#1234",
+            "race address must look like 192.168.1.5:7878#1234",
         )
     })?;
 
-    if addr.trim().is_empty() {
+    let addr = addr.trim();
+    if addr.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "race address host is empty",
@@ -274,8 +345,15 @@ pub fn parse_invite(input: &str) -> io::Result<RaceInvite> {
         ));
     }
 
+    // Default port to 7878 if the user only gave an IP without a port.
+    let addr = if addr.contains(':') {
+        addr.to_string()
+    } else {
+        format!("{addr}:{LOCAL_RACE_PORT}")
+    };
+
     Ok(RaceInvite {
-        addr: addr.trim().to_string(),
+        addr,
         room_code: room_code.to_string(),
     })
 }
@@ -313,11 +391,10 @@ fn spawn_host_accept_loop(
                             return;
                         }
                     },
+                    // Wrong room code or empty read — ignore, keep waiting.
                     Ok(false) => {}
-                    Err(error) => {
-                        let _ = sender.send(LobbyEvent::Failed(format!("race lobby failed: {error}")));
-                        return;
-                    }
+                    // Bad data (e.g. non-UTF-8, browser probe) — ignore, keep waiting.
+                    Err(_) => {}
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -354,8 +431,12 @@ fn handle_lobby_client(
     }
 
     writeln!(stream, "OK")?;
-    send_word_list(stream, words)?;
+
+    let encoded = serde_json::to_string(words)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    writeln!(stream, "WORDS {encoded}")?;
     writeln!(stream, "START")?;
+
     stream.flush()?;
     Ok(true)
 }
@@ -452,52 +533,6 @@ fn spawn_heartbeat_thread(
     });
 }
 
-/// Writes the race word list as a JSON array on one protocol line.
-fn send_word_list(stream: &mut TcpStream, words: &[String]) -> io::Result<()> {
-    let encoded = serde_json::to_string(words)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    writeln!(stream, "WORDS {encoded}")?;
-    stream.flush()
-}
-
-/// Reads the host-provided word list from the race protocol.
-fn read_word_list<R: BufRead>(reader: &mut R) -> io::Result<Vec<String>> {
-    let mut line = String::new();
-    if reader.read_line(&mut line)? == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "race host closed before sending words",
-        ));
-    }
-    trim_protocol_line(&mut line);
-
-    let encoded = line
-        .strip_prefix("WORDS ")
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid race word header"))?;
-    serde_json::from_str(encoded).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-}
-
-/// Reads the start signal that releases both players into the race.
-fn read_start<R: BufRead>(reader: &mut R) -> io::Result<()> {
-    let mut line = String::new();
-    if reader.read_line(&mut line)? == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "race host closed before sending start",
-        ));
-    }
-    trim_protocol_line(&mut line);
-
-    if line == "START" {
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid race start signal",
-        ))
-    }
-}
-
 enum PeerMessage {
     Event(RaceEvent),
     Ping,
@@ -511,6 +546,13 @@ fn parse_peer_message(line: &str) -> Option<PeerMessage> {
     }
     if line == "PONG" {
         return Some(PeerMessage::Pong);
+    }
+    if line == "START" {
+        return Some(PeerMessage::Event(RaceEvent::Start));
+    }
+    if let Some(encoded) = line.strip_prefix("WORDS ") {
+        let words: Vec<String> = serde_json::from_str(encoded).ok()?;
+        return Some(PeerMessage::Event(RaceEvent::SyncWords(words)));
     }
 
     let (kind, value) = line.split_once(' ')?;

@@ -471,8 +471,7 @@ enum State {
         error: Option<String>,
     },
     RaceLobby {
-        lobby: race::HostLobby,
-        test: Option<Test>,
+        test: Test,
         started_at: Instant,
         copied_at: Option<Instant>,
     },
@@ -486,6 +485,10 @@ enum State {
         receiver: Receiver<JoinRaceEvent>,
         started_at: Instant,
     },
+    JoinRaceLobby {
+        test: Test,
+        started_at: Instant,
+    },
     Test(Test),
     Results(Results),
 }
@@ -496,10 +499,7 @@ enum HostSetupEvent {
 }
 
 enum JoinRaceEvent {
-    Connected {
-        words: Vec<String>,
-        session: RaceSession,
-    },
+    Connected(Vec<String>, RaceSession),
     Failed(String),
 }
 
@@ -511,6 +511,8 @@ impl State {
         settings: &Settings,
         languages: &[String],
         chaos: &ChaosState,
+        race_session: &Option<RaceSession>,
+        host_lobby: &Option<race::HostLobby>,
     ) -> io::Result<()> {
         let theme = chaos.apply_theme(&config.theme, settings);
         match self {
@@ -546,6 +548,7 @@ impl State {
                             status: "Setting up local race lobby...",
                             spinner: spinner_at(*started_at),
                             cancel_label: "Press Esc to cancel and go back",
+                            start_label: "",
                             copy_hint: "",
                             error: error.as_deref(),
                         }),
@@ -554,12 +557,22 @@ impl State {
                 })?;
             }
             State::RaceLobby {
-                lobby, started_at, copied_at, ..
+                started_at,
+                copied_at,
+                ..
             } => {
+                let Some(lobby) = host_lobby else {
+                    return Ok(());
+                };
                 let copy_label = copied_at
                     .filter(|t| t.elapsed().as_secs() < 3)
                     .map(|_| "✓ Copied!")
                     .unwrap_or("Press C to copy");
+                let (status, start_label) = if race_session.is_some() {
+                    ("Opponent connected!", "Press S to start the race")
+                } else {
+                    ("Waiting for opponent to connect...", "")
+                };
                 terminal.draw(|f| {
                     let area = chaos.earthquake_area(f.size(), settings);
                     f.render_widget(
@@ -567,9 +580,10 @@ impl State {
                             room_code: lobby.room_code(),
                             public_addr: lobby.public_addr(),
                             invite_command: lobby.invite_command(),
-                            status: "Waiting for opponent to connect...",
+                            status,
                             spinner: spinner_at(*started_at),
                             cancel_label: "Press Esc to cancel and go back",
+                            start_label,
                             copy_hint: copy_label,
                             error: None,
                         }),
@@ -598,6 +612,18 @@ impl State {
                         theme.apply_to(ui::JoiningRaceView {
                             addr: &invite.addr,
                             room_code: &invite.room_code,
+                            spinner: spinner_at(*started_at),
+                        }),
+                        area,
+                    );
+                })?;
+            }
+            State::JoinRaceLobby { started_at, .. } => {
+                terminal.draw(|f| {
+                    let area = chaos.earthquake_area(f.size(), settings);
+                    f.render_widget(
+                        theme.apply_to(ui::JoinRaceLobbyView {
+                            status: "Joined race lobby!",
                             spinner: spinner_at(*started_at),
                         }),
                         area,
@@ -784,13 +810,11 @@ fn start_test(opt: &Opt) -> io::Result<StartOutcome> {
             .expect("race client should have a configured address");
         let invite = race::parse_invite(addr)?;
         println!("Connecting to race host {}...", invite.addr);
-        let (contents, session) = race::client(&invite).map_err(|error| {
+        let (words, session) = race::client(&invite).map_err(|error| {
             io::Error::new(error.kind(), format!("failed to connect to race: {error}"))
         })?;
-        ensure_contents_not_empty(&contents);
 
-        let mut test = build_synced_race_test(contents, opt);
-        test.enable_race();
+        let test = build_synced_race_test(words, opt);
         return Ok(StartOutcome::Test(test, Some(session)));
     }
 
@@ -802,13 +826,13 @@ fn start_test(opt: &Opt) -> io::Result<StartOutcome> {
 
     let test = build_test(contents, opt);
     if opt.is_race_host() {
-        let race_words = test
+        let words: Vec<String> = test
             .words
             .iter()
-            .map(|word| word.text.clone())
-            .collect::<Vec<_>>();
-        let lobby = race::HostLobby::start(DEFAULT_RACE_ADDR, race_words).map_err(|error| {
-            io::Error::new(error.kind(), format!("failed to host race: {error}"))
+            .map(|w| w.text.clone())
+            .collect();
+        let lobby = race::HostLobby::start(DEFAULT_RACE_ADDR, words).map_err(|error| {
+            io::Error::new(error.kind(), format!("failed to connect to race: {error}"))
         })?;
         return Ok(StartOutcome::RaceLobby { test, lobby });
     }
@@ -829,13 +853,9 @@ fn start_home_host_race(opt: &Opt, settings: &Settings) -> State {
 }
 
 fn start_host_lobby_setup(test: Test) -> State {
-    let race_words = test
-        .words
-        .iter()
-        .map(|word| word.text.clone())
-        .collect::<Vec<_>>();
+    let words = test.words.iter().map(|w| w.text.clone()).collect();
     State::RaceLobbyStarting {
-        receiver: spawn_host_lobby_setup(DEFAULT_RACE_ADDR.to_string(), race_words),
+        receiver: spawn_host_lobby_setup(DEFAULT_RACE_ADDR.to_string(), words),
         test: Some(test),
         started_at: Instant::now(),
         error: None,
@@ -858,7 +878,7 @@ fn spawn_join_race(invite: race::RaceInvite) -> Receiver<JoinRaceEvent> {
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
         let event = match race::client(&invite) {
-            Ok((words, session)) => JoinRaceEvent::Connected { words, session },
+            Ok((words, session)) => JoinRaceEvent::Connected(words, session),
             Err(_) => JoinRaceEvent::Failed(JOIN_RACE_ERROR_MESSAGE.into()),
         };
         let _ = sender.send(event);
@@ -904,12 +924,13 @@ fn build_prepared_test(
     )
 }
 
-/// Applies queued opponent race events to the active test.
+/// Applies queued opponent race events to the active test or lobby.
 fn apply_race_events(
     state: &mut State,
     race_session: &mut Option<RaceSession>,
     settings: &mut Settings,
     settings_path: &Path,
+    opt: &Opt,
 ) -> io::Result<()> {
     let Some(session) = race_session.as_mut() else {
         return Ok(());
@@ -919,8 +940,8 @@ fn apply_race_events(
     for event in events {
         let mut end_race = false;
 
-        if let State::Test(test) = state {
-            match event {
+        match state {
+            State::Test(test) => match event {
                 RaceEvent::OpponentProgress(progress) => {
                     test.update_race_opponent(progress);
                 }
@@ -946,11 +967,35 @@ fn apply_race_events(
                     );
                     end_race = true;
                 }
+                _ => {}
+            },
+            State::JoinRaceLobby {
+                test, started_at, ..
+            } => match event {
+                RaceEvent::SyncWords(words) => {
+                    *test = build_synced_race_test(words, opt);
+                    apply_persistent_gameplay_state(test, settings);
+                    *started_at = Instant::now();
+                }
+                RaceEvent::Start => {
+                    test.enable_race();
+                    *state = State::Test(std::mem::replace(test, Test::new_prepared(vec![], false, false, false, None, BTreeSet::new(), None)));
+                }
+                RaceEvent::Disconnected(_message) => {
+                    *race_session = None;
+                    *state = State::Welcome;
+                }
+                _ => {}
+            },
+            State::RaceLobby { .. } => {
+                if let RaceEvent::Disconnected(_message) = event {
+                    *race_session = None;
+                }
             }
+            _ => {}
         }
 
         if end_race {
-            *race_session = None;
             if let State::Test(test) = state {
                 *state = results_state_from_test(&*test, settings, settings_path)?;
             }
@@ -1065,6 +1110,7 @@ fn results_state_from_test(
 fn state_from_start_outcome(
     outcome: StartOutcome,
     settings: &Settings,
+    host_lobby: &mut Option<race::HostLobby>,
 ) -> (State, Option<RaceSession>) {
     match outcome {
         StartOutcome::Test(mut test, session) => {
@@ -1073,10 +1119,10 @@ fn state_from_start_outcome(
         }
         StartOutcome::RaceLobby { mut test, lobby } => {
             apply_persistent_gameplay_state(&mut test, settings);
+            *host_lobby = Some(lobby);
             (
                 State::RaceLobby {
-                    lobby,
-                    test: Some(test),
+                    test,
                     started_at: Instant::now(),
                     copied_at: None,
                 },
@@ -1137,16 +1183,17 @@ fn main() -> io::Result<()> {
 
     let mut state = State::Welcome;
     let mut race_session = None;
+    let mut host_lobby = None;
     let mut chaos = ChaosState::default();
 
     if cli_overrides.race {
         let effective = opt.effective(&settings, &cli_overrides);
-        let (initial_state, session) = state_from_start_outcome(start_test(&effective)?, &settings);
+        let (initial_state, session) = state_from_start_outcome(start_test(&effective)?, &settings, &mut host_lobby);
         state = initial_state;
         race_session = session;
     }
 
-    state.render_into(&mut terminal, &config, &settings, &languages, &chaos)?;
+    state.render_into(&mut terminal, &config, &settings, &languages, &chaos, &race_session, &host_lobby)?;
     loop {
         let event = if event::poll(Duration::from_millis(100))? {
             Some(event::read()?)
@@ -1157,7 +1204,7 @@ fn main() -> io::Result<()> {
         let now = Instant::now();
         chaos.tick(&settings, now);
         let was_test_before_race_events = matches!(state, State::Test(_));
-        apply_race_events(&mut state, &mut race_session, &mut settings, &settings_path)?;
+        apply_race_events(&mut state, &mut race_session, &mut settings, &settings_path, &opt)?;
         if was_test_before_race_events && !matches!(state, State::Test(_)) {
             chaos.reset_test_effects();
         }
@@ -1189,6 +1236,7 @@ fn main() -> io::Result<()> {
                 | State::RaceLobby { .. }
                 | State::JoinRace { .. }
                 | State::JoinRaceConnecting { .. }
+                | State::JoinRaceLobby { .. }
                 | State::Settings { .. } => {}
             },
             _ => {}
@@ -1196,6 +1244,7 @@ fn main() -> io::Result<()> {
 
         let mut next_state = None;
         let mut next_race_session = None;
+        let mut next_host_lobby = None;
         let mut settings_close_requested = false;
         let mut settings_open_requested = false;
 
@@ -1211,7 +1260,7 @@ fn main() -> io::Result<()> {
                     chaos.reset_test_effects();
                     let effective = opt.effective(&settings, &cli_overrides);
                     let (state, session) =
-                        state_from_start_outcome(start_test(&effective)?, &settings);
+                        state_from_start_outcome(start_test(&effective)?, &settings, &mut host_lobby);
                     next_race_session = Some(session);
                     next_state = Some(state);
                 }
@@ -1297,9 +1346,9 @@ fn main() -> io::Result<()> {
                             let Some(test) = test.take() else {
                                 continue;
                             };
+                            next_host_lobby = Some(Some(lobby));
                             next_state = Some(State::RaceLobby {
-                                lobby,
-                                test: Some(test),
+                                test,
                                 started_at: Instant::now(),
                                 copied_at: None,
                             });
@@ -1315,11 +1364,11 @@ fn main() -> io::Result<()> {
                 }
             }
             State::RaceLobby {
-                lobby,
                 test,
                 copied_at,
                 ..
             } => {
+                let lobby = host_lobby.as_mut().expect("RaceLobby state should have host_lobby");
                 if let Some(Event::Key(KeyEvent {
                     code: KeyCode::Esc,
                     kind: KeyEventKind::Press,
@@ -1328,6 +1377,7 @@ fn main() -> io::Result<()> {
                 })) = event
                 {
                     lobby.cancel();
+                    next_host_lobby = Some(None);
                     next_race_session = Some(None);
                     next_state = Some(State::Welcome);
                 } else if let Some(Event::Key(KeyEvent {
@@ -1342,25 +1392,46 @@ fn main() -> io::Result<()> {
                         let _ = clipboard.set_text(cmd);
                     }
                     *copied_at = Some(Instant::now());
+                } else if let Some(Event::Key(KeyEvent {
+                    code: KeyCode::Char('s') | KeyCode::Char('S'),
+                    kind: KeyEventKind::Press,
+                    modifiers: KeyModifiers::NONE | KeyModifiers::SHIFT,
+                    ..
+                })) = event
+                {
+                    if let Some(session) = race_session.as_mut() {
+                        let words: Vec<String> = test
+                            .words
+                            .iter()
+                            .map(|w| w.text.clone())
+                            .collect();
+                        let _ = session.send_words(&words);
+                        let _ = session.send_start();
+                        test.enable_race();
+                        next_state = Some(State::Test(std::mem::replace(test, Test::new_prepared(vec![], false, false, false, None, BTreeSet::new(), None))));
+                    }
                 } else if let Some(lobby_event) = lobby.poll() {
                     match lobby_event {
                         LobbyEvent::OpponentConnected(mut session) => {
-                            let Some(mut test) = test.take() else {
-                                continue;
-                            };
                             if let Some(tunnel) = lobby.take_tunnel() {
                                 session.keep_tunnel(tunnel);
                             }
-                            test.enable_race();
+                            let words: Vec<String> = test
+                                .words
+                                .iter()
+                                .map(|w| w.text.clone())
+                                .collect();
+                            let _ = session.send_words(&words);
                             next_race_session = Some(Some(session));
-                            next_state = Some(State::Test(test));
                         }
                         LobbyEvent::Cancelled => {
+                            next_host_lobby = Some(None);
                             next_race_session = Some(None);
                             next_state = Some(State::Welcome);
                         }
                         LobbyEvent::Failed(message) => {
                             eprintln!("{message}");
+                            next_host_lobby = Some(None);
                             next_race_session = Some(None);
                             next_state = Some(State::Welcome);
                         }
@@ -1437,18 +1508,11 @@ fn main() -> io::Result<()> {
                     next_state = Some(State::Welcome);
                 } else {
                     match receiver.try_recv() {
-                        Ok(JoinRaceEvent::Connected { words, session }) if !words.is_empty() => {
-                            let effective = opt.effective(&settings, &cli_overrides);
-                            let mut test = build_synced_race_test(words, &effective);
-                            apply_persistent_gameplay_state(&mut test, &settings);
-                            test.enable_race();
+                        Ok(JoinRaceEvent::Connected(words, session)) => {
                             next_race_session = Some(Some(session));
-                            next_state = Some(State::Test(test));
-                        }
-                        Ok(JoinRaceEvent::Connected { .. }) => {
-                            next_state = Some(State::JoinRace {
-                                input: input.clone(),
-                                error: Some(JOIN_RACE_ERROR_MESSAGE.into()),
+                            next_state = Some(State::JoinRaceLobby {
+                                test: build_synced_race_test(words, &opt),
+                                started_at: Instant::now(),
                             });
                         }
                         Ok(JoinRaceEvent::Failed(message)) => {
@@ -1465,6 +1529,18 @@ fn main() -> io::Result<()> {
                             });
                         }
                     }
+                }
+            }
+            State::JoinRaceLobby { .. } => {
+                if let Some(Event::Key(KeyEvent {
+                    code: KeyCode::Esc,
+                    kind: KeyEventKind::Press,
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                })) = event
+                {
+                    next_race_session = Some(None);
+                    next_state = Some(State::Welcome);
                 }
             }
             State::Test(ref mut test) => {
@@ -1492,9 +1568,6 @@ fn main() -> io::Result<()> {
                         )?);
                     } else if test.complete {
                         finalize_local_race(test);
-                        if test.race_progress.is_some() {
-                            next_race_session = Some(None);
-                        }
                         next_state = Some(results_state_from_test(
                             &*test,
                             &mut settings,
@@ -1512,14 +1585,28 @@ fn main() -> io::Result<()> {
                 })) => {
                     chaos.on_keypress(&settings);
                     if result.race_progress.is_some() {
-                        continue;
+                        if host_lobby.is_some() {
+                            let effective = opt.effective(&settings, &cli_overrides);
+                            let test = build_test(effective.gen_contents().unwrap_or_default(), &effective);
+                            next_state = Some(State::RaceLobby {
+                                test,
+                                started_at: Instant::now(),
+                                copied_at: None,
+                            });
+                        } else if race_session.is_some() {
+                            next_state = Some(State::JoinRaceLobby {
+                                test: Test::new_prepared(vec![], false, false, false, None, BTreeSet::new(), None),
+                                started_at: Instant::now(),
+                            });
+                        }
+                    } else {
+                        chaos.reset_test_effects();
+                        let effective = opt.effective(&settings, &cli_overrides);
+                        let (state, session) =
+                            state_from_start_outcome(start_test(&effective)?, &settings, &mut host_lobby);
+                        next_race_session = Some(session);
+                        next_state = Some(state);
                     }
-                    chaos.reset_test_effects();
-                    let effective = opt.effective(&settings, &cli_overrides);
-                    let (state, session) =
-                        state_from_start_outcome(start_test(&effective)?, &settings);
-                    next_race_session = Some(session);
-                    next_state = Some(state);
                 }
                 Some(Event::Key(KeyEvent {
                     code: KeyCode::Char('p'),
@@ -1572,6 +1659,9 @@ fn main() -> io::Result<()> {
         if let Some(session) = next_race_session {
             race_session = session;
         }
+        if let Some(lobby) = next_host_lobby {
+            host_lobby = lobby;
+        }
         if let Some(next) = next_state {
             if matches!(state, State::Test(_)) && !matches!(next, State::Test(_)) {
                 chaos.reset_test_effects();
@@ -1583,6 +1673,22 @@ fn main() -> io::Result<()> {
         }
         if settings_close_requested {
             close_settings(&mut state);
+            match &mut state {
+                State::RaceLobby { test, .. } => {
+                    let effective = opt.effective(&settings, &cli_overrides);
+                    *test = build_test(effective.gen_contents().unwrap_or_default(), &effective);
+                    apply_persistent_gameplay_state(test, &settings);
+                    if let Some(session) = race_session.as_mut() {
+                        let words: Vec<String> = test
+                            .words
+                            .iter()
+                            .map(|w| w.text.clone())
+                            .collect();
+                        let _ = session.send_words(&words);
+                    }
+                }
+                _ => {}
+            }
         }
 
         let now = Instant::now();
@@ -1591,9 +1697,6 @@ fn main() -> io::Result<()> {
             if test.complete {
                 finalize_local_race(test);
                 chaos.reset_test_effects();
-                if test.race_progress.is_some() {
-                    race_session = None;
-                }
                 state = results_state_from_test(&*test, &mut settings, &settings_path)?;
             }
         }
@@ -1620,14 +1723,11 @@ fn main() -> io::Result<()> {
             if let State::Test(test) = &mut state {
                 finalize_local_race(test);
                 chaos.reset_test_effects();
-                if test.race_progress.is_some() {
-                    race_session = None;
-                }
                 state = results_state_from_test(&*test, &mut settings, &settings_path)?;
             }
         }
 
-        state.render_into(&mut terminal, &config, &settings, &languages, &chaos)?;
+        state.render_into(&mut terminal, &config, &settings, &languages, &chaos, &race_session, &host_lobby)?;
     }
 
     terminal_cleanup.finish()?;
