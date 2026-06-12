@@ -602,10 +602,7 @@ fn detect_local_ip() -> Option<String> {
     use std::net::UdpSocket;
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("8.8.8.8:80").ok()?;
-    socket
-        .local_addr()
-        .ok()
-        .map(|addr| addr.ip().to_string())
+    socket.local_addr().ok().map(|addr| addr.ip().to_string())
 }
 
 #[cfg(test)]

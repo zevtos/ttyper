@@ -1,7 +1,9 @@
 mod chaos;
 mod config;
 mod gameplay;
+mod history;
 mod race;
+mod rank;
 mod settings;
 mod test;
 mod tunnel;
@@ -54,6 +56,29 @@ const PUNCTUATION_MARKS: [char; 4] = ['.', ',', '!', '?'];
 #[derive(RustEmbed)]
 #[folder = "resources/runtime"]
 struct Resources;
+
+/// Loads rank-corpus resources from the user's language dir (overrides) or
+/// the embedded resources.
+struct EmbeddedLoader {
+    language_dir: PathBuf,
+}
+
+impl rank::generate::ResourceLoader for EmbeddedLoader {
+    fn load_words(&self, resource: &str) -> Option<Vec<String>> {
+        let bytes = resource
+            .strip_prefix("language/")
+            .and_then(|name| fs::read(self.language_dir.join(name)).ok())
+            .or_else(|| Resources::get(resource).map(|file| file.data.into_owned()))?;
+        let text = str::from_utf8(&bytes).ok()?;
+        Some(
+            text.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(ToOwned::to_owned)
+                .collect(),
+        )
+    }
+}
 
 #[derive(Clone, Debug, Parser)]
 #[command(about, version)]
@@ -121,6 +146,11 @@ struct Opt {
     #[arg(long)]
     sudden_death: bool,
 
+    /// Phoenix Protocol: one mistake burns the test and a fresh word set
+    /// rises from the ashes (mutually exclusive with --sudden-death)
+    #[arg(long, conflicts_with = "sudden_death")]
+    phoenix: bool,
+
     /// Disable backspace
     #[arg(long)]
     no_backspace: bool,
@@ -132,6 +162,22 @@ struct Opt {
     /// Enable every gameplay feature, including power mode
     #[arg(long)]
     all_gameplay_features: bool,
+
+    /// Practice a typing rank (G lowest .. S highest)
+    #[arg(long, value_enum, ignore_case = true, value_name = "RANK")]
+    rank: Option<rank::Rank>,
+
+    /// Practice a specific level (1..=10) within the rank
+    #[arg(long, value_name = "N")]
+    level: Option<u32>,
+
+    /// Print rank/level progress and exit
+    #[arg(long)]
+    rank_status: bool,
+
+    /// Resolved rank session; computed, never parsed from the CLI.
+    #[clap(skip)]
+    rank_session: Option<rank::RankSession>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -158,6 +204,7 @@ struct CliOverrides {
     language: bool,
     no_backtrack: bool,
     sudden_death: bool,
+    phoenix: bool,
     no_backspace: bool,
     gameplay_features: bool,
     all_gameplay_features: bool,
@@ -176,6 +223,7 @@ impl CliOverrides {
             language: is_command_line_arg(matches, "language"),
             no_backtrack: is_command_line_arg(matches, "no_backtrack"),
             sudden_death: is_command_line_arg(matches, "sudden_death"),
+            phoenix: is_command_line_arg(matches, "phoenix"),
             no_backspace: is_command_line_arg(matches, "no_backspace"),
             gameplay_features: is_command_line_arg(matches, "gameplay_features"),
             all_gameplay_features: is_command_line_arg(matches, "all_gameplay_features"),
@@ -222,6 +270,17 @@ impl Opt {
         if !overrides.sudden_death {
             effective.sudden_death = settings.sudden_death;
         }
+        if !overrides.phoenix {
+            effective.phoenix = settings.phoenix;
+        }
+        // Mutually exclusive; an explicit CLI choice wins over saved settings.
+        if effective.phoenix && effective.sudden_death {
+            if overrides.sudden_death {
+                effective.phoenix = false;
+            } else {
+                effective.sudden_death = false;
+            }
+        }
         if !overrides.no_backspace {
             effective.no_backspace = settings.no_backspace;
         }
@@ -235,6 +294,57 @@ impl Opt {
     }
 
     fn gen_contents(&self) -> Result<Vec<String>, String> {
+        // Rank corpus, unless an explicit corpus (file/stdin/--language) wins.
+        if self.contents.is_none() && self.language_file.is_none() {
+            if let Some(session) = self.rank_session.as_ref().filter(|s| s.use_rank_corpus) {
+                let loader = EmbeddedLoader {
+                    language_dir: self.language_dir(),
+                };
+                let mut rng = thread_rng();
+                match rank::generate::generate_rank_corpus(
+                    &session.spec,
+                    self.generated_word_count(),
+                    &loader,
+                    &mut rng,
+                ) {
+                    Ok(mut words) => {
+                        // Explicit CLI difficulty flags layer on top of the
+                        // rank corpus (and already made the session
+                        // non-qualifying at resolution time).
+                        if session.cli_punctuation {
+                            for word in &mut words {
+                                if rng.gen_bool(PUNCTUATION_CHANCE) {
+                                    if let Some(mark) = PUNCTUATION_MARKS.choose(&mut rng) {
+                                        word.push(*mark);
+                                    }
+                                }
+                            }
+                        }
+                        if session.cli_numbers {
+                            let mut with_numbers = Vec::with_capacity(words.len());
+                            for word in words {
+                                with_numbers.push(word);
+                                if rng.gen_bool(NUMBER_CHANCE) {
+                                    with_numbers.push(rng.gen_range(0..100).to_string());
+                                }
+                            }
+                            words = with_numbers;
+                        }
+                        return Ok(words);
+                    }
+                    Err(error) => {
+                        // Never crash on a missing rank resource: fall back
+                        // to the legacy language path below.
+                        if self.debug {
+                            eprintln!(
+                                "[ttyper] rank corpus failed ({error}); using language fallback"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         match &self.contents {
             Some(path) => {
                 let contents: Vec<String> = if path.as_os_str() == "-" {
@@ -504,6 +614,7 @@ enum JoinRaceEvent {
 }
 
 impl State {
+    #[allow(clippy::too_many_arguments)]
     fn render_into<B: ratatui::backend::Backend>(
         &self,
         terminal: &mut Terminal<B>,
@@ -513,13 +624,19 @@ impl State {
         chaos: &ChaosState,
         race_session: &Option<RaceSession>,
         host_lobby: &Option<race::HostLobby>,
+        welcome_rank_line: Option<&str>,
     ) -> io::Result<()> {
         let theme = chaos.apply_theme(&config.theme, settings);
         match self {
             State::Welcome => {
                 terminal.draw(|f| {
                     let area = chaos.earthquake_area(f.size(), settings);
-                    f.render_widget(theme.apply_to(Welcome), area);
+                    f.render_widget(
+                        theme.apply_to(Welcome {
+                            rank_line: welcome_rank_line.map(str::to_string),
+                        }),
+                        area,
+                    );
                 })?;
             }
             State::Settings { screen, .. } => {
@@ -661,7 +778,9 @@ impl State {
     }
 }
 
-struct Welcome;
+struct Welcome {
+    rank_line: Option<String>,
+}
 
 struct TerminalCleanup {
     active: bool,
@@ -711,9 +830,18 @@ impl ui::ThemedWidget for Welcome {
             .margin(1)
             .split(area);
 
-        let content = Text::from(vec![
+        let mut lines = vec![
             Line::from(Span::styled("ttyper", theme.title)),
             Line::from(""),
+        ];
+        if let Some(rank_line) = &self.rank_line {
+            lines.push(Line::from(Span::styled(
+                rank_line.clone(),
+                theme.results_overview,
+            )));
+            lines.push(Line::from(""));
+        }
+        lines.extend(vec![
             Line::from(Span::styled("Press Enter to start", theme.results_overview)),
             Line::from(Span::styled(
                 "Press R to host race",
@@ -732,6 +860,7 @@ impl ui::ThemedWidget for Welcome {
                 theme.results_restart_prompt,
             )),
         ]);
+        let content = Text::from(lines);
 
         let welcome = Paragraph::new(content).block(
             Block::default()
@@ -742,6 +871,137 @@ impl ui::ThemedWidget for Welcome {
         );
         ratatui::widgets::Widget::render(welcome, chunks[0], buf);
     }
+}
+
+/// Computes the effective options and resolves the rank session for this
+/// launch. The rank session prescribes the word count unless `-w` was given.
+fn effective_with_rank(opt: &Opt, settings: &Settings, overrides: &CliOverrides) -> Opt {
+    let mut effective = opt.effective(settings, overrides);
+
+    // Without an explicit -w the level prescribes its word count, so saved
+    // settings don't silently disqualify rank sessions.
+    let word_count_for_gate = if overrides.words {
+        effective.words.get()
+    } else {
+        rank::ladder::WORD_COUNT_MIN
+    };
+    let session = rank::resolve_session(
+        effective.rank,
+        effective.level,
+        &settings.rank_profile,
+        &rank::SessionOverrides {
+            custom_corpus: effective.contents.is_some() || effective.language_file.is_some(),
+            language_override: overrides.language,
+            punctuation_override: overrides.punctuation,
+            numbers_override: overrides.numbers,
+            length_override: overrides.min_length || overrides.max_length,
+            time_mode: effective.time.is_some(),
+            race: effective.race.is_some(),
+            gameplay_features: !effective.gameplay_features.is_empty(),
+            word_count: word_count_for_gate,
+        },
+    );
+
+    if let Some(session) = &session {
+        if session.use_rank_corpus && !overrides.words {
+            effective.words = num::NonZeroUsize::new(session.spec.word_count_min)
+                .expect("prescribed word count is non-zero");
+        }
+    }
+    effective.rank_session = session;
+    effective
+}
+
+/// Test-start context for the history record, derived from the effective
+/// options. Race mode is stamped at test end from the live test state.
+fn build_session_meta(opt: &Opt, corpus_kind_override: Option<&str>) -> history::SessionMeta {
+    let rank_session = opt.rank_session.as_ref();
+    let corpus = if let Some(kind) = corpus_kind_override {
+        history::Corpus {
+            kind: kind.into(),
+            name: None,
+            language: None,
+        }
+    } else if let Some(path) = &opt.contents {
+        if path.as_os_str() == "-" {
+            history::Corpus {
+                kind: "stdin".into(),
+                name: None,
+                language: None,
+            }
+        } else {
+            history::Corpus {
+                kind: "file".into(),
+                name: path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned()),
+                language: None,
+            }
+        }
+    } else if let Some(path) = &opt.language_file {
+        history::Corpus {
+            kind: "file".into(),
+            name: path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned()),
+            language: None,
+        }
+    } else if let Some(session) = rank_session.filter(|session| session.use_rank_corpus) {
+        history::Corpus {
+            kind: "rank".into(),
+            name: Some(session.spec.id.key()),
+            language: None,
+        }
+    } else {
+        let language = opt.language.clone();
+        history::Corpus {
+            kind: "language".into(),
+            name: language.clone(),
+            language,
+        }
+    };
+
+    let mode = if opt.time.is_some() { "time" } else { "words" };
+    history::SessionMeta {
+        mode: mode.into(),
+        time_limit_secs: opt.time.map(num::NonZeroU64::get),
+        word_count_requested: (opt.time.is_none()).then(|| opt.words.get() as u32),
+        corpus,
+        rank: rank_session.map(|session| session.spec.id.rank.as_str().to_string()),
+        level: rank_session.map(|session| session.spec.id.level),
+        qualifying: rank_session.is_some_and(|session| session.qualifying),
+        phoenix: opt.phoenix,
+        chaos_modes: Vec::new(),
+    }
+}
+
+/// Welcome-screen summary of the rank session a plain Enter would start.
+fn rank_welcome_line(opt: &Opt, settings: &Settings, overrides: &CliOverrides) -> Option<String> {
+    let effective = effective_with_rank(opt, settings, overrides);
+    let session = effective.rank_session?;
+    Some(rank::welcome_line(&settings.rank_profile, &session))
+}
+
+/// Chaos modes are display-only and recorded for completeness.
+fn chaos_mode_names(settings: &Settings) -> Vec<String> {
+    [
+        ("rainbow", settings.chaos_rainbow_mode),
+        ("seizure", settings.chaos_seizure_mode),
+        ("disco", settings.chaos_disco_mode),
+        ("drunk", settings.chaos_drunk_mode),
+        ("tiny", settings.chaos_tiny_mode),
+        ("mirror", settings.chaos_mirror_mode),
+        ("ghost", settings.chaos_ghost_mode),
+        ("earthquake", settings.chaos_earthquake_mode),
+        ("speed-demon", settings.chaos_speed_demon_mode),
+        ("haunted", settings.chaos_haunted_mode),
+        ("blackout", settings.chaos_blackout_mode),
+        ("neon", settings.chaos_neon_mode),
+    ]
+    .into_iter()
+    .filter(|(_, enabled)| *enabled)
+    .map(|(name, _)| name.to_string())
+    .collect()
 }
 
 fn language_names(opt: &Opt) -> io::Result<Vec<String>> {
@@ -826,11 +1086,7 @@ fn start_test(opt: &Opt) -> io::Result<StartOutcome> {
 
     let test = build_test(contents, opt);
     if opt.is_race_host() {
-        let words: Vec<String> = test
-            .words
-            .iter()
-            .map(|w| w.text.clone())
-            .collect();
+        let words: Vec<String> = test.words.iter().map(|w| w.text.clone()).collect();
         let lobby = race::HostLobby::start(DEFAULT_RACE_ADDR, words).map_err(|error| {
             io::Error::new(error.kind(), format!("failed to connect to race: {error}"))
         })?;
@@ -898,14 +1154,18 @@ fn ensure_contents_not_empty(contents: &[String]) {
 fn build_test(contents: Vec<String>, opt: &Opt) -> Test {
     let gameplay_features = feature_set(&opt.gameplay_features);
     let prepared_words = gameplay::prepare_words(contents, &gameplay_features);
-    build_prepared_test(prepared_words, opt, gameplay_features)
+    let mut test = build_prepared_test(prepared_words, opt, gameplay_features);
+    test.session_meta = Some(build_session_meta(opt, None));
+    test
 }
 
 /// Builds a race client test from host-synchronized words without re-randomizing them.
 fn build_synced_race_test(contents: Vec<String>, opt: &Opt) -> Test {
     let gameplay_features = feature_set(&opt.gameplay_features);
     let prepared_words = contents.into_iter().map(PreparedWord::from).collect();
-    build_prepared_test(prepared_words, opt, gameplay_features)
+    let mut test = build_prepared_test(prepared_words, opt, gameplay_features);
+    test.session_meta = Some(build_session_meta(opt, Some("race_synced")));
+    test
 }
 
 fn build_prepared_test(
@@ -913,7 +1173,7 @@ fn build_prepared_test(
     opt: &Opt,
     gameplay_features: BTreeSet<GameplayFeature>,
 ) -> Test {
-    Test::new_prepared(
+    let mut test = Test::new_prepared(
         prepared_words,
         !opt.no_backtrack,
         opt.sudden_death,
@@ -921,7 +1181,20 @@ fn build_prepared_test(
         opt.time_limit(),
         gameplay_features,
         None,
-    )
+    );
+    test.rank_tag = opt
+        .rank_session
+        .as_ref()
+        .filter(|session| session.use_rank_corpus)
+        .map(|session| {
+            format!(
+                "{}·L{}",
+                session.spec.id.rank.as_str(),
+                session.spec.id.level
+            )
+        });
+    test.phoenix_enabled = opt.phoenix;
+    test
 }
 
 /// Applies queued opponent race events to the active test or lobby.
@@ -930,6 +1203,7 @@ fn apply_race_events(
     race_session: &mut Option<RaceSession>,
     settings: &mut Settings,
     settings_path: &Path,
+    history_path: &Path,
     opt: &Opt,
 ) -> io::Result<()> {
     let Some(session) = race_session.as_mut() else {
@@ -979,7 +1253,18 @@ fn apply_race_events(
                 }
                 RaceEvent::Start => {
                     test.enable_race();
-                    *state = State::Test(std::mem::replace(test, Test::new_prepared(vec![], false, false, false, None, BTreeSet::new(), None)));
+                    *state = State::Test(std::mem::replace(
+                        test,
+                        Test::new_prepared(
+                            vec![],
+                            false,
+                            false,
+                            false,
+                            None,
+                            BTreeSet::new(),
+                            None,
+                        ),
+                    ));
                 }
                 RaceEvent::Disconnected(_message) => {
                     *race_session = None;
@@ -997,7 +1282,14 @@ fn apply_race_events(
 
         if end_race {
             if let State::Test(test) = state {
-                *state = results_state_from_test(&*test, settings, settings_path)?;
+                *state = results_state_from_test(
+                    &*test,
+                    settings,
+                    settings_path,
+                    history_path,
+                    opt.debug,
+                    None,
+                )?;
             }
         }
     }
@@ -1097,13 +1389,62 @@ fn update_best_wpm(
     Ok(())
 }
 
+/// The single end-of-test funnel: computes results, persists the history
+/// record, and evaluates rank promotion. History failures never block the
+/// results screen.
 fn results_state_from_test(
     test: &Test,
     settings: &mut Settings,
     settings_path: &Path,
+    history_path: &Path,
+    debug: bool,
+    end_reason_hint: Option<&str>,
 ) -> io::Result<State> {
-    let results = Results::from(test);
+    let mut results = Results::from(test);
     update_best_wpm(settings, settings_path, &results)?;
+
+    if let Some(meta) = &test.session_meta {
+        let mut meta = meta.clone();
+        if test.race_progress.is_some() {
+            meta.mode = "race".into();
+            meta.qualifying = false;
+        }
+        if let Some(mut record) = history::build_record(test, &results, &meta, end_reason_hint) {
+            record.chaos_modes = chaos_mode_names(settings);
+
+            if let Some(id) = record
+                .rank
+                .as_ref()
+                .zip(record.level)
+                .and_then(|(rank, level)| rank::LevelId::parse(rank, level))
+            {
+                let spec = rank::ladder::level_spec(id);
+                if record.corpus.kind == "rank" && record.completed {
+                    let improved = settings.rank_profile.record_best(id, record.adjusted_wpm);
+                    if improved {
+                        settings.save_to(settings_path)?;
+                    }
+                }
+                let (outcome, streak) =
+                    rank::promotion::evaluate(&settings.rank_profile, &spec, history_path, &record);
+                record.promotion_event = match &outcome {
+                    rank::promotion::PromotionOutcome::None => None,
+                    rank::promotion::PromotionOutcome::LevelCleared { .. } => {
+                        Some("level_cleared".into())
+                    }
+                    rank::promotion::PromotionOutcome::RankUp { .. } => {
+                        Some("rank_promoted".into())
+                    }
+                    rank::promotion::PromotionOutcome::Mastery { .. } => Some("mastery".into()),
+                };
+                results.rank_banner =
+                    Some(rank::promotion::banner(&spec, outcome, &record, streak));
+            }
+
+            history::append_record_best_effort(history_path, &record, debug);
+        }
+    }
+
     Ok(State::Results(results))
 }
 
@@ -1158,10 +1499,31 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
+    if let Some(level) = opt.level {
+        if !(1..=rank::LEVELS_PER_RANK).contains(&level) {
+            eprintln!("Error: levels are 1..={}.", rank::LEVELS_PER_RANK);
+            std::process::exit(1);
+        }
+    }
+
     let settings_path = settings_path(opt.config_dir());
+    let history_file = history::history_path(&opt.config_dir());
     let mut settings =
         Settings::load_or_default(&settings_path, &config.default_language, &languages)?;
     apply_settings_theme(&mut config, &configured_theme, &settings);
+
+    if opt.rank_status {
+        let effective = effective_with_rank(&opt, &settings, &cli_overrides);
+        print!(
+            "{}",
+            rank::status::render(
+                &settings.rank_profile,
+                effective.rank_session.as_ref(),
+                &history_file,
+            )
+        );
+        return Ok(());
+    }
 
     if opt.debug {
         dbg!(&config);
@@ -1187,13 +1549,24 @@ fn main() -> io::Result<()> {
     let mut chaos = ChaosState::default();
 
     if cli_overrides.race {
-        let effective = opt.effective(&settings, &cli_overrides);
-        let (initial_state, session) = state_from_start_outcome(start_test(&effective)?, &settings, &mut host_lobby);
+        let effective = effective_with_rank(&opt, &settings, &cli_overrides);
+        let (initial_state, session) =
+            state_from_start_outcome(start_test(&effective)?, &settings, &mut host_lobby);
         state = initial_state;
         race_session = session;
     }
 
-    state.render_into(&mut terminal, &config, &settings, &languages, &chaos, &race_session, &host_lobby)?;
+    let welcome_rank_line = rank_welcome_line(&opt, &settings, &cli_overrides);
+    state.render_into(
+        &mut terminal,
+        &config,
+        &settings,
+        &languages,
+        &chaos,
+        &race_session,
+        &host_lobby,
+        welcome_rank_line.as_deref(),
+    )?;
     loop {
         let event = if event::poll(Duration::from_millis(100))? {
             Some(event::read()?)
@@ -1204,7 +1577,14 @@ fn main() -> io::Result<()> {
         let now = Instant::now();
         chaos.tick(&settings, now);
         let was_test_before_race_events = matches!(state, State::Test(_));
-        apply_race_events(&mut state, &mut race_session, &mut settings, &settings_path, &opt)?;
+        apply_race_events(
+            &mut state,
+            &mut race_session,
+            &mut settings,
+            &settings_path,
+            &history_file,
+            &opt,
+        )?;
         if was_test_before_race_events && !matches!(state, State::Test(_)) {
             chaos.reset_test_effects();
         }
@@ -1230,7 +1610,14 @@ fn main() -> io::Result<()> {
                     if test.race_progress.is_some() {
                         race_session = None;
                     }
-                    state = results_state_from_test(test, &mut settings, &settings_path)?;
+                    state = results_state_from_test(
+                        test,
+                        &mut settings,
+                        &settings_path,
+                        &history_file,
+                        opt.debug,
+                        Some("aborted"),
+                    )?;
                 }
                 State::RaceLobbyStarting { .. }
                 | State::RaceLobby { .. }
@@ -1258,9 +1645,12 @@ fn main() -> io::Result<()> {
                 })) => {
                     chaos.on_keypress(&settings);
                     chaos.reset_test_effects();
-                    let effective = opt.effective(&settings, &cli_overrides);
-                    let (state, session) =
-                        state_from_start_outcome(start_test(&effective)?, &settings, &mut host_lobby);
+                    let effective = effective_with_rank(&opt, &settings, &cli_overrides);
+                    let (state, session) = state_from_start_outcome(
+                        start_test(&effective)?,
+                        &settings,
+                        &mut host_lobby,
+                    );
                     next_race_session = Some(session);
                     next_state = Some(state);
                 }
@@ -1272,7 +1662,7 @@ fn main() -> io::Result<()> {
                 })) => {
                     chaos.on_keypress(&settings);
                     chaos.reset_test_effects();
-                    let effective = opt.effective(&settings, &cli_overrides);
+                    let effective = effective_with_rank(&opt, &settings, &cli_overrides);
                     next_race_session = Some(None);
                     next_state = Some(start_home_host_race(&effective, &settings));
                 }
@@ -1364,11 +1754,11 @@ fn main() -> io::Result<()> {
                 }
             }
             State::RaceLobby {
-                test,
-                copied_at,
-                ..
+                test, copied_at, ..
             } => {
-                let lobby = host_lobby.as_mut().expect("RaceLobby state should have host_lobby");
+                let lobby = host_lobby
+                    .as_mut()
+                    .expect("RaceLobby state should have host_lobby");
                 if let Some(Event::Key(KeyEvent {
                     code: KeyCode::Esc,
                     kind: KeyEventKind::Press,
@@ -1400,15 +1790,23 @@ fn main() -> io::Result<()> {
                 })) = event
                 {
                     if let Some(session) = race_session.as_mut() {
-                        let words: Vec<String> = test
-                            .words
-                            .iter()
-                            .map(|w| w.text.clone())
-                            .collect();
+                        let words: Vec<String> =
+                            test.words.iter().map(|w| w.text.clone()).collect();
                         let _ = session.send_words(&words);
                         let _ = session.send_start();
                         test.enable_race();
-                        next_state = Some(State::Test(std::mem::replace(test, Test::new_prepared(vec![], false, false, false, None, BTreeSet::new(), None))));
+                        next_state = Some(State::Test(std::mem::replace(
+                            test,
+                            Test::new_prepared(
+                                vec![],
+                                false,
+                                false,
+                                false,
+                                None,
+                                BTreeSet::new(),
+                                None,
+                            ),
+                        )));
                     }
                 } else if let Some(lobby_event) = lobby.poll() {
                     match lobby_event {
@@ -1416,11 +1814,8 @@ fn main() -> io::Result<()> {
                             if let Some(tunnel) = lobby.take_tunnel() {
                                 session.keep_tunnel(tunnel);
                             }
-                            let words: Vec<String> = test
-                                .words
-                                .iter()
-                                .map(|w| w.text.clone())
-                                .collect();
+                            let words: Vec<String> =
+                                test.words.iter().map(|w| w.text.clone()).collect();
                             let _ = session.send_words(&words);
                             next_race_session = Some(Some(session));
                         }
@@ -1559,12 +1954,29 @@ fn main() -> io::Result<()> {
                     }
                     let after_progress = test.completed_word_count();
                     chaos.observe_word_progress(&settings, before_progress, after_progress, now);
-                    if report_race_progress(test, &mut race_session, before_progress) {
+                    if test.regen_requested {
+                        // Phoenix death: respawn the test with a freshly
+                        // generated word set; no history record for ashes.
+                        test.regen_requested = false;
+                        chaos.reset_test_effects();
+                        let effective = effective_with_rank(&opt, &settings, &cli_overrides);
+                        let contents = effective.gen_contents().unwrap_or_default();
+                        if contents.is_empty() {
+                            test.reset();
+                        } else {
+                            let mut reborn = build_test(contents, &effective);
+                            apply_persistent_gameplay_state(&mut reborn, &settings);
+                            next_state = Some(State::Test(reborn));
+                        }
+                    } else if report_race_progress(test, &mut race_session, before_progress) {
                         next_race_session = Some(None);
                         next_state = Some(results_state_from_test(
                             &*test,
                             &mut settings,
                             &settings_path,
+                            &history_file,
+                            opt.debug,
+                            None,
                         )?);
                     } else if test.complete {
                         finalize_local_race(test);
@@ -1572,11 +1984,41 @@ fn main() -> io::Result<()> {
                             &*test,
                             &mut settings,
                             &settings_path,
+                            &history_file,
+                            opt.debug,
+                            None,
                         )?);
                     }
                 }
             }
             State::Results(ref result) => match event {
+                Some(Event::Key(KeyEvent {
+                    code: KeyCode::Char('n') | KeyCode::Char('N'),
+                    kind: KeyEventKind::Press,
+                    modifiers: KeyModifiers::NONE | KeyModifiers::SHIFT,
+                    ..
+                })) if result
+                    .rank_banner
+                    .as_ref()
+                    .is_some_and(|banner| banner.outcome.advances()) =>
+                {
+                    chaos.on_keypress(&settings);
+                    let banner = result
+                        .rank_banner
+                        .clone()
+                        .expect("guard checked the banner exists");
+                    rank::promotion::commit_advance(&mut settings.rank_profile, &banner.outcome);
+                    settings.save_to(&settings_path)?;
+                    chaos.reset_test_effects();
+                    let effective = effective_with_rank(&opt, &settings, &cli_overrides);
+                    let (state, session) = state_from_start_outcome(
+                        start_test(&effective)?,
+                        &settings,
+                        &mut host_lobby,
+                    );
+                    next_race_session = Some(session);
+                    next_state = Some(state);
+                }
                 Some(Event::Key(KeyEvent {
                     code: KeyCode::Char('r'),
                     kind: KeyEventKind::Press,
@@ -1586,8 +2028,11 @@ fn main() -> io::Result<()> {
                     chaos.on_keypress(&settings);
                     if result.race_progress.is_some() {
                         if host_lobby.is_some() {
-                            let effective = opt.effective(&settings, &cli_overrides);
-                            let test = build_test(effective.gen_contents().unwrap_or_default(), &effective);
+                            let effective = effective_with_rank(&opt, &settings, &cli_overrides);
+                            let test = build_test(
+                                effective.gen_contents().unwrap_or_default(),
+                                &effective,
+                            );
                             next_state = Some(State::RaceLobby {
                                 test,
                                 started_at: Instant::now(),
@@ -1595,15 +2040,26 @@ fn main() -> io::Result<()> {
                             });
                         } else if race_session.is_some() {
                             next_state = Some(State::JoinRaceLobby {
-                                test: Test::new_prepared(vec![], false, false, false, None, BTreeSet::new(), None),
+                                test: Test::new_prepared(
+                                    vec![],
+                                    false,
+                                    false,
+                                    false,
+                                    None,
+                                    BTreeSet::new(),
+                                    None,
+                                ),
                                 started_at: Instant::now(),
                             });
                         }
                     } else {
                         chaos.reset_test_effects();
-                        let effective = opt.effective(&settings, &cli_overrides);
-                        let (state, session) =
-                            state_from_start_outcome(start_test(&effective)?, &settings, &mut host_lobby);
+                        let effective = effective_with_rank(&opt, &settings, &cli_overrides);
+                        let (state, session) = state_from_start_outcome(
+                            start_test(&effective)?,
+                            &settings,
+                            &mut host_lobby,
+                        );
                         next_race_session = Some(session);
                         next_state = Some(state);
                     }
@@ -1627,10 +2083,19 @@ fn main() -> io::Result<()> {
                         .flat_map(|w| vec![w.clone(); 5])
                         .collect();
                     practice_words.shuffle(&mut thread_rng());
-                    let effective = opt.effective(&settings, &cli_overrides);
+                    let effective = effective_with_rank(&opt, &settings, &cli_overrides);
                     chaos.reset_test_effects();
                     next_race_session = Some(None);
                     let mut test = build_test(practice_words, &effective);
+                    if let Some(meta) = &mut test.session_meta {
+                        // Practice repeats missed words; never a rank corpus.
+                        meta.corpus = history::Corpus {
+                            kind: "practice".into(),
+                            name: None,
+                            language: None,
+                        };
+                        meta.qualifying = false;
+                    }
                     apply_persistent_gameplay_state(&mut test, &settings);
                     next_state = Some(State::Test(test));
                 }
@@ -1673,21 +2138,14 @@ fn main() -> io::Result<()> {
         }
         if settings_close_requested {
             close_settings(&mut state);
-            match &mut state {
-                State::RaceLobby { test, .. } => {
-                    let effective = opt.effective(&settings, &cli_overrides);
-                    *test = build_test(effective.gen_contents().unwrap_or_default(), &effective);
-                    apply_persistent_gameplay_state(test, &settings);
-                    if let Some(session) = race_session.as_mut() {
-                        let words: Vec<String> = test
-                            .words
-                            .iter()
-                            .map(|w| w.text.clone())
-                            .collect();
-                        let _ = session.send_words(&words);
-                    }
+            if let State::RaceLobby { test, .. } = &mut state {
+                let effective = effective_with_rank(&opt, &settings, &cli_overrides);
+                *test = build_test(effective.gen_contents().unwrap_or_default(), &effective);
+                apply_persistent_gameplay_state(test, &settings);
+                if let Some(session) = race_session.as_mut() {
+                    let words: Vec<String> = test.words.iter().map(|w| w.text.clone()).collect();
+                    let _ = session.send_words(&words);
                 }
-                _ => {}
             }
         }
 
@@ -1697,7 +2155,14 @@ fn main() -> io::Result<()> {
             if test.complete {
                 finalize_local_race(test);
                 chaos.reset_test_effects();
-                state = results_state_from_test(&*test, &mut settings, &settings_path)?;
+                state = results_state_from_test(
+                    &*test,
+                    &mut settings,
+                    &settings_path,
+                    &history_file,
+                    opt.debug,
+                    None,
+                )?;
             }
         }
 
@@ -1723,11 +2188,31 @@ fn main() -> io::Result<()> {
             if let State::Test(test) = &mut state {
                 finalize_local_race(test);
                 chaos.reset_test_effects();
-                state = results_state_from_test(&*test, &mut settings, &settings_path)?;
+                state = results_state_from_test(
+                    &*test,
+                    &mut settings,
+                    &settings_path,
+                    &history_file,
+                    opt.debug,
+                    Some("timeout"),
+                )?;
             }
         }
 
-        state.render_into(&mut terminal, &config, &settings, &languages, &chaos, &race_session, &host_lobby)?;
+        let welcome_rank_line = match &state {
+            State::Welcome => rank_welcome_line(&opt, &settings, &cli_overrides),
+            _ => None,
+        };
+        state.render_into(
+            &mut terminal,
+            &config,
+            &settings,
+            &languages,
+            &chaos,
+            &race_session,
+            &host_lobby,
+            welcome_rank_line.as_deref(),
+        )?;
     }
 
     terminal_cleanup.finish()?;
@@ -1757,9 +2242,14 @@ mod tests {
             list_languages: false,
             no_backtrack: false,
             sudden_death: false,
+            phoenix: false,
             no_backspace: false,
             gameplay_features: Vec::new(),
             all_gameplay_features: false,
+            rank: None,
+            level: None,
+            rank_status: false,
+            rank_session: None,
             command: None,
         }
     }
@@ -1821,6 +2311,135 @@ mod tests {
             .unwrap();
 
         assert_eq!(words, vec!["rust"]);
+    }
+
+    #[test]
+    fn rank_corpus_generates_from_embedded_resources() {
+        let mut opt = make_opt(PathBuf::from("unused"));
+        opt.contents = None;
+        let settings = Settings::default();
+        let overrides = CliOverrides::default();
+
+        for rank in rank::ALL_RANKS {
+            for level in [1, 5, 10] {
+                opt.rank = Some(rank);
+                opt.level = Some(level);
+                let effective = effective_with_rank(&opt, &settings, &overrides);
+                let session = effective
+                    .rank_session
+                    .as_ref()
+                    .expect("rank session should resolve");
+                assert!(session.use_rank_corpus);
+                let words = effective
+                    .gen_contents()
+                    .unwrap_or_else(|e| panic!("{}{} corpus failed: {e}", rank.as_str(), level));
+                assert_eq!(
+                    words.len(),
+                    50,
+                    "{}{} should produce the prescribed word count",
+                    rank.as_str(),
+                    level
+                );
+                assert!(words.iter().all(|word| !word.is_empty()));
+            }
+        }
+    }
+
+    #[test]
+    fn rank_g1_words_match_plain_english200_shape() {
+        let mut opt = make_opt(PathBuf::from("unused"));
+        opt.contents = None;
+        opt.rank = Some(rank::Rank::G);
+        opt.level = Some(1);
+        let effective = effective_with_rank(&opt, &Settings::default(), &CliOverrides::default());
+        let words = effective.gen_contents().unwrap();
+        assert!(words
+            .iter()
+            .all(|word| word.chars().all(|c| c.is_alphabetic() && c.is_lowercase())));
+    }
+
+    #[test]
+    fn no_rank_flags_keep_legacy_session_meta() {
+        let opt = make_opt(PathBuf::from("unused"));
+        let effective = effective_with_rank(&opt, &Settings::default(), &CliOverrides::default());
+        assert!(effective.rank_session.is_none());
+        let meta = build_session_meta(&effective, None);
+        assert_eq!(meta.mode, "words");
+        assert!(meta.rank.is_none());
+        assert!(!meta.qualifying);
+    }
+
+    #[test]
+    fn funnel_writes_history_record_and_evaluates_promotion() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        let history_path = dir.path().join("history.jsonl");
+        let mut settings = Settings::default();
+
+        let mut opt = make_opt(PathBuf::from("unused"));
+        opt.contents = None;
+        opt.rank = Some(rank::Rank::G);
+        let effective = effective_with_rank(&opt, &settings, &CliOverrides::default());
+
+        let mut test = build_test(vec!["ab".into(), "cd".into()], &effective);
+        for c in ['a', 'b', ' ', 'c', 'd'] {
+            test.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert!(test.complete);
+
+        let state = results_state_from_test(
+            &test,
+            &mut settings,
+            &settings_path,
+            &history_path,
+            false,
+            None,
+        )
+        .unwrap();
+        let State::Results(results) = state else {
+            panic!("expected results state");
+        };
+        let banner = results.rank_banner.expect("rank session should set banner");
+        assert!(
+            banner.outcome.advances(),
+            "instant perfect run should clear G1"
+        );
+
+        let records = history::read_tail(&history_path, &history::TailQuery::default()).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].corpus.kind, "rank");
+        assert_eq!(records[0].rank.as_deref(), Some("G"));
+        assert_eq!(records[0].promotion_event.as_deref(), Some("level_cleared"));
+        assert!(records[0].completed);
+        assert!(records[0].qualifying);
+        assert_eq!(records[0].keystrokes.len(), 5);
+        assert!(settings
+            .rank_profile
+            .best_wpm(rank::LevelId::new(rank::Rank::G, 1))
+            .is_some());
+    }
+
+    #[test]
+    fn explicit_sudden_death_beats_saved_phoenix() {
+        let mut opt = make_opt(PathBuf::from("unused"));
+        opt.sudden_death = true;
+        let settings = Settings {
+            phoenix: true,
+            ..Default::default()
+        };
+        let overrides = CliOverrides {
+            sudden_death: true,
+            ..Default::default()
+        };
+
+        let effective = opt.effective(&settings, &overrides);
+        assert!(effective.sudden_death);
+        assert!(!effective.phoenix);
+
+        // Without the explicit CLI flag the saved phoenix wins.
+        let effective = opt.effective(&settings, &CliOverrides::default());
+        assert!(effective.phoenix);
+        assert!(!effective.sudden_death);
     }
 
     #[test]

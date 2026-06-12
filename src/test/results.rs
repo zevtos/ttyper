@@ -66,6 +66,7 @@ pub struct Results {
     pub race_progress: Option<RaceProgress>,
     pub gameplay_multiplier: f64,
     pub gameplay_summary: Vec<String>,
+    pub rank_banner: Option<crate::rank::promotion::PromotionBanner>,
 }
 
 impl From<&Test> for Results {
@@ -80,6 +81,7 @@ impl From<&Test> for Results {
             race_progress: test.race_progress.clone(),
             gameplay_multiplier: test.gameplay_multiplier(),
             gameplay_summary: gameplay_summary(test),
+            rank_banner: None,
         }
     }
 }

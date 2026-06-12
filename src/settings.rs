@@ -1,6 +1,7 @@
 use crate::{
     config::{Theme, THEME_NAMES},
     gameplay::{normalize_features, GameplayFeature, ALL_GAMEPLAY_FEATURES},
+    rank::{Rank, RankProfile, ALL_RANKS, LEVELS_PER_RANK},
     ui::ThemedWidget,
 };
 
@@ -28,6 +29,7 @@ pub const MAX_WORD_LENGTHS: [Option<usize>; 4] = [None, Some(6), Some(8), Some(1
 #[serde(default)]
 pub struct Settings {
     pub sudden_death: bool,
+    pub phoenix: bool,
     pub no_backtrack: bool,
     pub no_backspace: bool,
     pub time_limit: Option<u64>,
@@ -54,12 +56,14 @@ pub struct Settings {
     pub chaos_neon_mode: bool,
     pub gameplay_features: Vec<GameplayFeature>,
     pub best_wpm: f64,
+    pub rank_profile: RankProfile,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             sudden_death: false,
+            phoenix: false,
             no_backtrack: false,
             no_backspace: false,
             time_limit: None,
@@ -86,6 +90,7 @@ impl Default for Settings {
             chaos_neon_mode: false,
             gameplay_features: Vec::new(),
             best_wpm: 0.0,
+            rank_profile: RankProfile::default(),
         }
     }
 }
@@ -148,10 +153,15 @@ impl Settings {
                     .unwrap_or_else(|| "english200".into())
             };
         }
+        // Phoenix Protocol and classic sudden death are mutually exclusive.
+        if self.phoenix && self.sudden_death {
+            self.sudden_death = false;
+        }
         self.gameplay_features = normalize_features(&self.gameplay_features);
         if !self.best_wpm.is_finite() || self.best_wpm < 0.0 {
             self.best_wpm = 0.0;
         }
+        self.rank_profile.normalize();
     }
 
     pub fn enabled_chaos_count(&self) -> usize {
@@ -201,10 +211,13 @@ pub enum SettingsAction {
 #[derive(Clone, Copy)]
 enum SettingItem {
     SuddenDeath,
+    Phoenix,
     NoBacktrack,
     NoBackspace,
     TimeLimit,
     WordCount,
+    RankSelection,
+    LevelSelection,
     Punctuation,
     Numbers,
     MinWordLength,
@@ -234,12 +247,15 @@ enum Step {
     Next,
 }
 
-const BASE_SELECTABLE_ITEMS: [SettingItem; 24] = [
+const BASE_SELECTABLE_ITEMS: [SettingItem; 27] = [
     SettingItem::SuddenDeath,
+    SettingItem::Phoenix,
     SettingItem::NoBacktrack,
     SettingItem::NoBackspace,
     SettingItem::TimeLimit,
     SettingItem::WordCount,
+    SettingItem::RankSelection,
+    SettingItem::LevelSelection,
     SettingItem::Punctuation,
     SettingItem::Numbers,
     SettingItem::MinWordLength,
@@ -326,7 +342,20 @@ impl SettingsScreen {
 
     fn activate_selected(&mut self, settings: &mut Settings) -> SettingsAction {
         match self.selected_item() {
-            SettingItem::SuddenDeath => toggle(&mut settings.sudden_death),
+            SettingItem::SuddenDeath => {
+                settings.sudden_death = !settings.sudden_death;
+                if settings.sudden_death {
+                    settings.phoenix = false;
+                }
+                SettingsAction::Changed
+            }
+            SettingItem::Phoenix => {
+                settings.phoenix = !settings.phoenix;
+                if settings.phoenix {
+                    settings.sudden_death = false;
+                }
+                SettingsAction::Changed
+            }
             SettingItem::NoBacktrack => toggle(&mut settings.no_backtrack),
             SettingItem::NoBackspace => toggle(&mut settings.no_backspace),
             SettingItem::Punctuation => toggle(&mut settings.punctuation),
@@ -356,6 +385,7 @@ impl SettingsScreen {
     fn toggle_selected(&mut self, settings: &mut Settings) -> SettingsAction {
         match self.selected_item() {
             SettingItem::SuddenDeath
+            | SettingItem::Phoenix
             | SettingItem::NoBacktrack
             | SettingItem::NoBackspace
             | SettingItem::Punctuation
@@ -409,6 +439,46 @@ impl SettingsScreen {
             }
             SettingItem::Language if !languages.is_empty() => {
                 settings.language = cycle_string(&settings.language, languages, step);
+                SettingsAction::Changed
+            }
+            SettingItem::RankSelection => {
+                let order: Vec<Option<Rank>> = std::iter::once(None)
+                    .chain(ALL_RANKS.into_iter().map(Some))
+                    .collect();
+                let index = order
+                    .iter()
+                    .position(|option| *option == settings.rank_profile.selected_rank)
+                    .unwrap_or_default();
+                let next = match step {
+                    Step::Previous => index.checked_sub(1).unwrap_or(order.len() - 1),
+                    Step::Next => (index + 1) % order.len(),
+                };
+                settings.rank_profile.selected_rank = order[next];
+                settings.rank_profile.selected_level = settings
+                    .rank_profile
+                    .selected_rank
+                    .map(|rank| settings.rank_profile.default_level_for(rank));
+                SettingsAction::Changed
+            }
+            SettingItem::LevelSelection if settings.rank_profile.selected_rank.is_some() => {
+                let current = settings.rank_profile.selected_level.unwrap_or(1);
+                let next = match step {
+                    Step::Previous => {
+                        if current <= 1 {
+                            LEVELS_PER_RANK
+                        } else {
+                            current - 1
+                        }
+                    }
+                    Step::Next => {
+                        if current >= LEVELS_PER_RANK {
+                            1
+                        } else {
+                            current + 1
+                        }
+                    }
+                };
+                settings.rank_profile.selected_level = Some(next);
                 SettingsAction::Changed
             }
             _ => SettingsAction::None,
@@ -559,6 +629,17 @@ fn settings_lines(
     );
     push_item(
         &mut lines,
+        format!(
+            "{} Phoenix Protocol - one mistake burns the text, a new set rises",
+            checkbox(settings.phoenix)
+        ),
+        &mut selectable,
+        &mut selected_line,
+        screen,
+        theme,
+    );
+    push_item(
+        &mut lines,
         format!("{} No Backtrack", checkbox(settings.no_backtrack)),
         &mut selectable,
         &mut selected_line,
@@ -589,6 +670,67 @@ fn settings_lines(
         screen,
         theme,
     );
+
+    push_section(&mut lines, "RANK", theme);
+    let profile = &settings.rank_profile;
+    let rank_label = match profile.selected_rank {
+        None => "Off (classic)".to_string(),
+        Some(rank) => {
+            let level = profile.selected_level.unwrap_or(1);
+            let id = crate::rank::LevelId::new(rank, level);
+            if profile.is_unlocked(id) {
+                rank.as_str().to_string()
+            } else {
+                format!("{} (preview)", rank.as_str())
+            }
+        }
+    };
+    push_item(
+        &mut lines,
+        format!("Rank: < {rank_label} >"),
+        &mut selectable,
+        &mut selected_line,
+        screen,
+        theme,
+    );
+    let level_label = match profile.selected_rank {
+        None => "-".to_string(),
+        Some(rank) => {
+            let level = profile.selected_level.unwrap_or(1);
+            let id = crate::rank::LevelId::new(rank, level);
+            let spec = crate::rank::ladder::level_spec(id);
+            let best = profile
+                .best_wpm(id)
+                .map(|wpm| format!("best {wpm:.0}"))
+                .unwrap_or_else(|| "no best".into());
+            format!(
+                "{level}  ({best} · need {:.0} WPM @ {:.0}%{})",
+                spec.wpm_threshold,
+                spec.accuracy_threshold * 100.0,
+                if profile.cleared(id) {
+                    " · cleared"
+                } else {
+                    ""
+                }
+            )
+        }
+    };
+    push_item(
+        &mut lines,
+        format!("Level: < {level_label} >"),
+        &mut selectable,
+        &mut selected_line,
+        screen,
+        theme,
+    );
+    lines.push(Line::from(Span::styled(
+        format!(
+            "Unlocked up to: {} · Level {}",
+            profile.current_rank.as_str(),
+            profile.current_level
+        ),
+        theme.results_overview,
+    )));
 
     push_section(&mut lines, "DIFFICULTY", theme);
     push_item(
@@ -895,6 +1037,18 @@ mod tests {
     #[test]
     fn chaos_defaults_are_disabled() {
         assert_eq!(Settings::default().enabled_chaos_count(), 0);
+    }
+
+    #[test]
+    fn normalize_keeps_only_one_death_mode() {
+        let mut settings = Settings {
+            phoenix: true,
+            sudden_death: true,
+            ..Default::default()
+        };
+        settings.normalize("english200", &["english200".into()]);
+        assert!(settings.phoenix);
+        assert!(!settings.sudden_death);
     }
 
     #[test]

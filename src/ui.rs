@@ -444,6 +444,10 @@ impl ThemedWidget for TestView<'_> {
             input_title.push(Span::raw(" "));
             input_title.push(Span::styled(part, theme.results_timer));
         }
+        if let Some(tag) = &test.rank_tag {
+            input_title.push(Span::raw(" "));
+            input_title.push(Span::styled(tag.clone(), theme.results_overview));
+        }
 
         // Sections
         let input = SizedBlock {
@@ -1003,6 +1007,15 @@ impl ThemedWidget for &results::Results {
             Line::from(format!("Correct Keypresses: {}", self.accuracy.overall)),
         ]);
         overview_text.extend(self.gameplay_summary.iter().cloned().map(Line::from));
+        if let Some(banner) = &self.rank_banner {
+            overview_text.extend([Line::from(banner.progress_line.clone())]);
+            if !banner.message.is_empty() {
+                overview_text.extend([Line::from(Span::styled(
+                    banner.message.clone(),
+                    theme.results_timer,
+                ))]);
+            }
+        }
         if let Some(race) = &self.race_progress {
             let message = race.message.clone().unwrap_or_else(|| match race.outcome {
                 Some(RaceOutcome::Win) => "You won!".into(),

@@ -194,6 +194,14 @@ pub struct Test {
     pub sudden_death_enabled: bool,
     pub backspace_enabled: bool,
     pub gameplay: GameplayState,
+    /// Launch context recorded into history at test end; None skips recording.
+    pub session_meta: Option<crate::history::SessionMeta>,
+    /// Compact rank/level tag (e.g. "D·L3") shown in the test title.
+    pub rank_tag: Option<String>,
+    /// Phoenix Protocol: one mistake burns the test; a fresh word set rises.
+    pub phoenix_enabled: bool,
+    /// Set on a phoenix death; the main loop rebuilds the test with new words.
+    pub regen_requested: bool,
 }
 
 impl Test {
@@ -233,6 +241,10 @@ impl Test {
             sudden_death_enabled,
             backspace_enabled,
             gameplay: GameplayState::new(gameplay_features, ghost_best_wpm),
+            session_meta: None,
+            rank_tag: None,
+            phoenix_enabled: false,
+            regen_requested: false,
         }
     }
 
@@ -386,7 +398,11 @@ impl Test {
         }
         if self.gameplay.is_enabled(GameplayFeature::SuddenDeathPlus) {
             self.end_test("Sudden death mistake");
-        } else if self.sudden_death_enabled {
+        } else if self.phoenix_enabled && self.race_progress.is_none() {
+            // Phoenix death: the whole word set burns and respawns fresh.
+            self.regen_requested = true;
+        } else if self.sudden_death_enabled || self.phoenix_enabled {
+            // Phoenix inside a race can't regenerate synced words; classic reset.
             self.reset();
         }
     }
@@ -814,6 +830,9 @@ impl Test {
                 threat.progress
             ));
         }
+        if self.phoenix_enabled {
+            parts.push("PHOENIX".into());
+        }
         if let Some(reason) = &self.gameplay.end_reason {
             parts.push(reason.clone());
         }
@@ -1006,7 +1025,7 @@ impl Test {
         }
     }
 
-    fn reset(&mut self) {
+    pub fn reset(&mut self) {
         self.words.iter_mut().for_each(|word: &mut TestWord| {
             word.progress.clear();
             word.events.clear();
@@ -1245,6 +1264,35 @@ mod tests {
         assert!(test.complete);
         assert_eq!(test.gameplay.combo, 2);
         assert_eq!(test.gameplay.max_combo, 2);
+    }
+
+    #[test]
+    fn phoenix_requests_regen_on_first_mistake() {
+        let mut test = Test::new(vec!["hello".into()], true, false, true);
+        test.phoenix_enabled = true;
+
+        test.handle_key(key_char('h'));
+        assert!(!test.regen_requested);
+
+        test.handle_key(key_char('x'));
+        assert!(test.regen_requested, "wrong char should burn the test");
+        assert!(!test.complete);
+    }
+
+    #[test]
+    fn phoenix_in_race_falls_back_to_classic_reset() {
+        let mut test = Test::new(vec!["hello".into()], true, false, true);
+        test.phoenix_enabled = true;
+        test.enable_race();
+
+        test.handle_key(key_char('h'));
+        test.handle_key(key_char('x'));
+
+        assert!(!test.regen_requested, "synced race words cannot regenerate");
+        assert!(
+            test.words[0].progress.is_empty(),
+            "classic reset should clear progress"
+        );
     }
 
     #[test]
