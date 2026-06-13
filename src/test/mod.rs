@@ -398,12 +398,25 @@ impl Test {
         }
         if self.gameplay.is_enabled(GameplayFeature::SuddenDeathPlus) {
             self.end_test("Sudden death mistake");
-        } else if self.phoenix_enabled && self.race_progress.is_none() {
+        } else {
+            self.trigger_death_modes();
+        }
+    }
+
+    /// Applies classic sudden-death and Phoenix Protocol on any error.
+    /// Returns true when the test was reset or queued for a phoenix respawn,
+    /// so callers can halt further word advancement.
+    fn trigger_death_modes(&mut self) -> bool {
+        if self.phoenix_enabled && self.race_progress.is_none() {
             // Phoenix death: the whole word set burns and respawns fresh.
             self.regen_requested = true;
+            true
         } else if self.sudden_death_enabled || self.phoenix_enabled {
             // Phoenix inside a race can't regenerate synced words; classic reset.
             self.reset();
+            true
+        } else {
+            false
         }
     }
 
@@ -419,13 +432,15 @@ impl Test {
             key,
         });
 
-        if correct {
+        let died = if correct {
             self.record_correct_word(word_kind, was_penalty_skip, event_time);
+            false
         } else {
-            self.record_failed_word(word_kind, event_time);
-        }
+            self.record_failed_word(word_kind, event_time)
+        };
 
-        if self.complete {
+        // A death mode reset or queued a respawn; don't advance past it.
+        if self.complete || died {
             return;
         }
 
@@ -498,11 +513,12 @@ impl Test {
         }
     }
 
-    fn record_failed_word(&mut self, word_kind: WordKind, event_time: Instant) {
+    /// Returns true when a death mode reset the test or queued a respawn.
+    fn record_failed_word(&mut self, word_kind: WordKind, event_time: Instant) -> bool {
         if self.gameplay.word_shield_available {
             self.gameplay.word_shield_available = false;
             self.gameplay.combo = 0;
-            return;
+            return false;
         }
 
         self.gameplay.mistakes += 1;
@@ -529,6 +545,10 @@ impl Test {
         if self.gameplay.is_enabled(GameplayFeature::PrecisionMode) {
             self.gameplay.freeze_until = Some(event_time + PRECISION_FREEZE);
         }
+        if self.complete {
+            return false;
+        }
+        self.trigger_death_modes()
     }
 
     fn current_word_is_correct_submission(&self) -> bool {
@@ -631,12 +651,13 @@ impl Test {
         {
             let correct = self.current_word_is_correct_submission();
             self.record_forced_submission_event(now, correct);
-            if correct {
+            let died = if correct {
                 self.record_correct_word(self.words[self.current_word].kind, false, now);
+                false
             } else {
-                self.record_failed_word(self.words[self.current_word].kind, now);
-            }
-            if !self.complete {
+                self.record_failed_word(self.words[self.current_word].kind, now)
+            };
+            if !self.complete && !died {
                 self.next_word(now);
             }
             return;
@@ -748,11 +769,11 @@ impl Test {
 
     fn force_fail_current_word(&mut self, now: Instant, reason: &'static str) {
         self.record_forced_submission_event(now, false);
-        self.record_failed_word(self.words[self.current_word].kind, now);
+        let died = self.record_failed_word(self.words[self.current_word].kind, now);
         if self.gameplay.end_reason.is_none() {
             self.gameplay.end_reason = Some(reason.into());
         }
-        if !self.complete {
+        if !self.complete && !died {
             self.next_word(now);
         }
     }
@@ -1276,6 +1297,20 @@ mod tests {
 
         test.handle_key(key_char('x'));
         assert!(test.regen_requested, "wrong char should burn the test");
+        assert!(!test.complete);
+    }
+
+    #[test]
+    fn phoenix_burns_on_wrong_word_submit() {
+        let mut test = Test::new(vec!["hello".into(), "world".into()], true, false, true);
+        test.phoenix_enabled = true;
+
+        // Submit the first word incomplete via space; should burn, not skip.
+        test.handle_key(key_char('h'));
+        test.handle_key(key_enter());
+
+        assert!(test.regen_requested, "submitting a wrong word should burn");
+        assert_eq!(test.current_word, 0, "must not advance to the next word");
         assert!(!test.complete);
     }
 
