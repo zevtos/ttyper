@@ -61,6 +61,10 @@ pub struct HistoryRecord {
     /// a fresh one; this record is the surviving (mistake-free) run.
     #[serde(default)]
     pub phoenix: bool,
+    /// Phoenix deaths preceding this surviving run since the last record.
+    /// Non-zero means the consistency streak was broken just before this run.
+    #[serde(default)]
+    pub deaths_before: u32,
     #[serde(default)]
     pub keystrokes: Vec<Keystroke>,
     pub per_key_accuracy: HashMap<String, [u32; 2]>,
@@ -248,6 +252,7 @@ pub fn build_record(
         chaos_modes: meta.chaos_modes.clone(),
         gameplay_multiplier: test.gameplay_multiplier(),
         phoenix: meta.phoenix,
+        deaths_before: test.phoenix_deaths,
         keystrokes,
         per_key_accuracy,
         per_key_mean_ms,

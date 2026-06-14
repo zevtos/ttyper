@@ -880,11 +880,6 @@ fn effective_with_rank(opt: &Opt, settings: &Settings, overrides: &CliOverrides)
 
     // Without an explicit -w the level prescribes its word count, so saved
     // settings don't silently disqualify rank sessions.
-    let word_count_for_gate = if overrides.words {
-        effective.words.get()
-    } else {
-        rank::ladder::WORD_COUNT_MIN
-    };
     let session = rank::resolve_session(
         effective.rank,
         effective.level,
@@ -898,7 +893,7 @@ fn effective_with_rank(opt: &Opt, settings: &Settings, overrides: &CliOverrides)
             time_mode: effective.time.is_some(),
             race: effective.race.is_some(),
             gameplay_features: !effective.gameplay_features.is_empty(),
-            word_count: word_count_for_gate,
+            word_count: overrides.words.then(|| effective.words.get()),
         },
     );
 
@@ -1965,6 +1960,9 @@ fn main() -> io::Result<()> {
                             test.reset();
                         } else {
                             let mut reborn = build_test(contents, &effective);
+                            // Carry the death count so the surviving run records
+                            // how many times it burned (breaks the streak).
+                            reborn.phoenix_deaths = test.phoenix_deaths + 1;
                             apply_persistent_gameplay_state(&mut reborn, &settings);
                             next_state = Some(State::Test(reborn));
                         }
@@ -2330,12 +2328,13 @@ mod tests {
                     .as_ref()
                     .expect("rank session should resolve");
                 assert!(session.use_rank_corpus);
+                let expected = session.spec.word_count_min;
                 let words = effective
                     .gen_contents()
                     .unwrap_or_else(|e| panic!("{}{} corpus failed: {e}", rank.as_str(), level));
                 assert_eq!(
                     words.len(),
-                    50,
+                    expected,
                     "{}{} should produce the prescribed word count",
                     rank.as_str(),
                     level

@@ -212,7 +212,9 @@ pub struct SessionOverrides {
     pub time_mode: bool,
     pub race: bool,
     pub gameplay_features: bool,
-    pub word_count: usize,
+    /// Explicit `-w` count. `None` means the level prescribes its own count,
+    /// which always satisfies the word-count gate.
+    pub word_count: Option<usize>,
 }
 
 /// Resolved rank context for one test session.
@@ -267,7 +269,8 @@ pub fn resolve_session(
         && !overrides.time_mode
         && !overrides.race
         && !overrides.gameplay_features
-        && overrides.word_count >= spec.word_count_min;
+        // None = prescribed count (always qualifies); Some(n) must meet the floor.
+        && overrides.word_count.is_none_or(|count| count >= spec.word_count_min);
 
     Some(RankSession {
         spec,
@@ -337,7 +340,7 @@ mod tests {
     fn resolve_session_preview_for_locked_rank() {
         let profile = RankProfile::default();
         let overrides = SessionOverrides {
-            word_count: 50,
+            word_count: Some(50),
             ..Default::default()
         };
         let session = resolve_session(Some(Rank::S), None, &profile, &overrides).unwrap();
@@ -350,7 +353,7 @@ mod tests {
     fn resolve_session_qualifying_on_clean_launch() {
         let profile = RankProfile::default();
         let overrides = SessionOverrides {
-            word_count: 50,
+            word_count: Some(50),
             ..Default::default()
         };
         let session = resolve_session(Some(Rank::G), None, &profile, &overrides).unwrap();
@@ -364,21 +367,21 @@ mod tests {
         let profile = RankProfile::default();
         for overrides in [
             SessionOverrides {
-                word_count: 50,
+                word_count: Some(50),
                 time_mode: true,
                 ..Default::default()
             },
             SessionOverrides {
-                word_count: 50,
+                word_count: Some(50),
                 gameplay_features: true,
                 ..Default::default()
             },
             SessionOverrides {
-                word_count: 25,
+                word_count: Some(10),
                 ..Default::default()
             },
             SessionOverrides {
-                word_count: 50,
+                word_count: Some(50),
                 punctuation_override: true,
                 ..Default::default()
             },
@@ -392,7 +395,7 @@ mod tests {
     fn resolve_session_custom_corpus_wins_over_rank() {
         let profile = RankProfile::default();
         let overrides = SessionOverrides {
-            word_count: 50,
+            word_count: Some(50),
             custom_corpus: true,
             ..Default::default()
         };

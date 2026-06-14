@@ -46,25 +46,36 @@ fn meets(spec: &LevelSpec, wpm: f64, accuracy: f64) -> bool {
     wpm >= spec.wpm_threshold && accuracy >= spec.accuracy_threshold
 }
 
-fn qualifying_metrics(record: &HistoryRecord) -> Option<(f64, f64)> {
-    (record.qualifying && record.completed && record.corpus.kind == "rank")
-        .then_some((record.adjusted_wpm, record.accuracy))
+/// (adjusted WPM, accuracy, phoenix deaths immediately before this run).
+struct SessionOutcome {
+    wpm: f64,
+    accuracy: f64,
+    deaths_before: u32,
 }
 
-/// Most-recent run of qualifying sessions (history tail plus optionally the
-/// current record) that meet the level's thresholds, capped at the
-/// consistency requirement. Unreadable history counts as zero sessions.
+fn qualifying_metrics(record: &HistoryRecord) -> Option<SessionOutcome> {
+    (record.qualifying && record.completed && record.corpus.kind == "rank").then_some(
+        SessionOutcome {
+            wpm: record.adjusted_wpm,
+            accuracy: record.accuracy,
+            deaths_before: record.deaths_before,
+        },
+    )
+}
+
+/// Most-recent qualifying sessions (history tail plus optionally the current
+/// record), chronological. Unreadable history counts as zero sessions.
 fn recent_sessions(
     spec: &LevelSpec,
     history_path: &Path,
     current: Option<&HistoryRecord>,
-) -> Vec<(f64, f64)> {
+) -> Vec<SessionOutcome> {
     let query = TailQuery {
         limit: 0,
         rank: Some(spec.id.rank.as_str().to_string()),
         level: Some(spec.id.level),
     };
-    let mut sessions: Vec<(f64, f64)> = history::read_tail(history_path, &query)
+    let mut sessions: Vec<SessionOutcome> = history::read_tail(history_path, &query)
         .unwrap_or_default()
         .iter()
         .filter_map(qualifying_metrics)
@@ -75,18 +86,31 @@ fn recent_sessions(
     sessions
 }
 
-/// Length of the trailing streak of sessions meeting the thresholds.
+/// Trailing streak of sessions meeting the thresholds, walking newest-first.
+/// A Phoenix run that burned before surviving (`deaths_before > 0`) caps the
+/// streak there: the chain back to the previous survival is broken, so
+/// "consecutive" means clean survivals with no deaths between them.
 pub fn recent_streak(
     spec: &LevelSpec,
     history_path: &Path,
     current: Option<&HistoryRecord>,
 ) -> usize {
-    recent_sessions(spec, history_path, current)
-        .iter()
-        .rev()
-        .take_while(|(wpm, accuracy)| meets(spec, *wpm, *accuracy))
-        .count()
-        .min(spec.consistency_n as usize)
+    let sessions = recent_sessions(spec, history_path, current);
+    let mut streak = 0usize;
+    for outcome in sessions.iter().rev() {
+        if !meets(spec, outcome.wpm, outcome.accuracy) {
+            break;
+        }
+        streak += 1;
+        if streak >= spec.consistency_n as usize {
+            break;
+        }
+        // Deaths preceding this survival break the chain to the older one.
+        if outcome.deaths_before > 0 {
+            break;
+        }
+    }
+    streak.min(spec.consistency_n as usize)
 }
 
 /// Evaluates the just-finished session. Returns the outcome and the current
@@ -102,10 +126,10 @@ pub fn evaluate(
     if profile.cleared(spec.id) {
         return (PromotionOutcome::None, streak);
     }
-    let Some((wpm, accuracy)) = qualifying_metrics(current) else {
+    let Some(outcome) = qualifying_metrics(current) else {
         return (PromotionOutcome::None, streak);
     };
-    if !meets(spec, wpm, accuracy) || streak < spec.consistency_n as usize {
+    if !meets(spec, outcome.wpm, outcome.accuracy) || streak < spec.consistency_n as usize {
         return (PromotionOutcome::None, streak);
     }
 
@@ -227,6 +251,7 @@ mod tests {
             chaos_modes: Vec::new(),
             gameplay_multiplier: 1.0,
             phoenix: false,
+            deaths_before: 0,
             keystrokes: Vec::new(),
             per_key_accuracy: HashMap::new(),
             per_key_mean_ms: HashMap::new(),
@@ -277,6 +302,31 @@ mod tests {
         // A second consecutive pass clears it (E needs 2).
         append_record(&path, &record("E", 1, 60.0, 0.99, true)).unwrap();
         let (outcome, streak) = evaluate(&profile, &spec, &path, &current);
+        assert_eq!(streak, 2);
+        assert!(outcome.advances());
+    }
+
+    #[test]
+    fn phoenix_deaths_break_the_consecutive_streak() {
+        let (_dir, path) = temp_history();
+        let mut profile = RankProfile::default();
+        profile.unlock(LevelId::new(Rank::E, 1));
+        let spec = level_spec(LevelId::new(Rank::E, 1));
+
+        // A clean first survival, then a survival that burned twice before
+        // succeeding. E needs 2 consecutive with no deaths between → no clear.
+        append_record(&path, &record("E", 1, 60.0, 1.0, true)).unwrap();
+        let mut burned = record("E", 1, 60.0, 1.0, true);
+        burned.deaths_before = 2;
+
+        let (outcome, streak) = evaluate(&profile, &spec, &path, &burned);
+        assert_eq!(streak, 1, "deaths before the run break the chain back");
+        assert_eq!(outcome, PromotionOutcome::None);
+
+        // A first-try survival (no deaths) right after a clean run clears it.
+        append_record(&path, &record("E", 1, 60.0, 1.0, true)).unwrap();
+        let first_try = record("E", 1, 60.0, 1.0, true); // deaths_before = 0
+        let (outcome, streak) = evaluate(&profile, &spec, &path, &first_try);
         assert_eq!(streak, 2);
         assert!(outcome.advances());
     }

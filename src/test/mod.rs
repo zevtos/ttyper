@@ -202,6 +202,10 @@ pub struct Test {
     pub phoenix_enabled: bool,
     /// Set on a phoenix death; the main loop rebuilds the test with new words.
     pub regen_requested: bool,
+    /// Phoenix deaths since the last recorded run; carried across respawns so
+    /// the surviving record knows how many times it burned first. Non-zero
+    /// breaks the promotion streak (deaths count against consistency).
+    pub phoenix_deaths: u32,
 }
 
 impl Test {
@@ -245,6 +249,7 @@ impl Test {
             rank_tag: None,
             phoenix_enabled: false,
             regen_requested: false,
+            phoenix_deaths: 0,
         }
     }
 

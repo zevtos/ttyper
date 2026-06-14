@@ -22,7 +22,11 @@ pub const RANK_FLOORS: [(f64, f64); 8] = [
 /// Most-recent-N qualifying sessions that must all meet the thresholds, G..S.
 pub const CONSISTENCY_N: [u8; 8] = [1, 1, 2, 2, 3, 3, 4, 5];
 
-pub const WORD_COUNT_MIN: usize = 50;
+/// Prescribed word count at level 1 of each rank, G..S. Higher ranks demand
+/// sustained concentration: a longer text is harder to keep mistake-free
+/// (and brutally so under Phoenix Protocol). Interpolated across levels like
+/// the WPM threshold, so length grows smoothly across all 80 rungs.
+pub const RANK_WORD_COUNT_FLOORS: [usize; 8] = [25, 35, 50, 65, 85, 110, 140, 180];
 
 #[derive(Clone, Debug)]
 pub struct LevelSpec {
@@ -43,16 +47,24 @@ pub fn level_spec(id: LevelId) -> LevelSpec {
         .copied()
         .unwrap_or((floor_wpm + 20.0, floor_accuracy + 0.03));
 
+    let floor_words = RANK_WORD_COUNT_FLOORS[rank_index];
+    // S extends with +20 words per level beyond its floor.
+    let next_words = RANK_WORD_COUNT_FLOORS
+        .get(rank_index + 1)
+        .copied()
+        .unwrap_or(floor_words + 200);
+
     let step = (id.level - 1) as f64 / f64::from(LEVELS_PER_RANK);
     let wpm_threshold = floor_wpm + (next_wpm - floor_wpm) * step;
     let accuracy_threshold = (floor_accuracy + (next_accuracy - floor_accuracy) * step).min(0.999);
+    let word_count_min = floor_words + ((next_words - floor_words) as f64 * step).round() as usize;
 
     LevelSpec {
         id,
         wpm_threshold,
         accuracy_threshold,
         consistency_n: CONSISTENCY_N[rank_index],
-        word_count_min: WORD_COUNT_MIN,
+        word_count_min,
         recipe: recipe_for(id),
     }
 }
@@ -93,6 +105,23 @@ mod tests {
                 let higher = level_spec(LevelId::new(rank, level + 1));
                 assert!(higher.wpm_threshold > lower.wpm_threshold);
                 assert!(higher.accuracy_threshold >= lower.accuracy_threshold);
+            }
+        }
+    }
+
+    #[test]
+    fn word_count_grows_with_rank() {
+        let g1 = level_spec(LevelId::new(Rank::G, 1));
+        let s1 = level_spec(LevelId::new(Rank::S, 1));
+        assert_eq!(g1.word_count_min, 25);
+        assert_eq!(s1.word_count_min, 180);
+        // Monotonic non-decreasing across the whole 80-rung ladder.
+        let mut previous = 0;
+        for rank in ALL_RANKS {
+            for level in 1..=10 {
+                let count = level_spec(LevelId::new(rank, level)).word_count_min;
+                assert!(count >= previous, "{:?} L{level} dropped word count", rank);
+                previous = count;
             }
         }
     }
